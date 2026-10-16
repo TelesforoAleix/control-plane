@@ -183,6 +183,8 @@ on pushes to `main`. Main requires the `test` check and forbids force pushes.
 
 ## Runner
 
+At the end of each pass, the runner restores clean detached clones to their default branch and removes old, removable Codex worktrees for repositories with no busy slices.
+
 ```sh
 export CPLANE_REPOS="$HOME/Code"
 export CPLANE_RUNS="$HOME/Library/Application Support/cplane/runs"
