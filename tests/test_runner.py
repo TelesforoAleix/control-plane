@@ -36,6 +36,7 @@ class FakeProcesses:
 class FakeGitHub:
     def __init__(self):
         self.open = Mock(return_value=12)
+        self.find_pr = Mock(return_value=None)
         self.checks = Mock(return_value=('pending', ''))
         self.merge = Mock(return_value='abc123')
 
@@ -82,6 +83,7 @@ def test_pass_order_prompt_session_and_notices(setup):
     assert r.git.mock_calls[-1][0] == 'commit'
     assert r.git.commit.call_count == 3
     assert len(p.started) == 1
+    assert r.github.find_pr.call_count == 1
     r.run()
     assert item(r)['state'] == 'in review'
 
@@ -515,6 +517,64 @@ def test_process_final_freshness(tmp_path, tool, fresh):
     assert result == (final if fresh else None)
     if fresh:
         assert session == 'session'
+
+
+def test_process_records_codex_session_before_exit(tmp_path):
+    job = {'tool': 'codex', 'run': str(tmp_path), 'started_ns': 0, 'session': ''}
+    (tmp_path / 'turn.jsonl').write_text('{"type":"thread.started","thread_id":"early-session"}\n')
+    done, session, final, _ = Processes().poll(job)
+    assert not done and final is None
+    assert session == 'early-session'
+
+
+def test_codex_pr_lookup_uses_newest_matching_pr():
+    gh = GitHub()
+    gh.call = Mock(return_value=json.dumps([
+        {'number': 10, 'createdAt': '2026-10-01T00:00:00Z'},
+        {'number': 11, 'createdAt': '2026-10-10T00:00:00Z'},
+    ]))
+    assert gh.find_pr('owner/repo', 'feature') == 11
+    gh.call.assert_called_once_with('owner/repo', 'pr', 'list', '--head', 'feature', '--state', 'all',
+                                    '--json', 'number,createdAt')
+
+
+def test_missing_final_escalation_summarizes_tool_exit(setup, tmp_path):
+    r, _, _ = setup
+    r.at = NOW.isoformat()
+    candidate = item(r)
+    run = tmp_path / 'run'
+    run.mkdir()
+    r.apply_final(candidate, {'tool': 'codex', 'final': None,
+                             'tail': 'codex exec exited 2: unexpected argument\nother output',
+                             'run': str(run), 'phase': 'ended'})
+    assert candidate['attention']['body'] == 'codex exec exited 2: unexpected argument\n\nother output'
+
+
+def test_process_exit_summary_uses_first_stderr_line(tmp_path):
+    (tmp_path / 'exit.json').write_text('{"code":2}')
+    (tmp_path / 'stderr.log').write_text('unexpected argument --foo\nmore detail\n')
+    (tmp_path / 'turn.jsonl').write_text('output\n')
+    job = {'tool': 'codex', 'run': str(tmp_path), 'started_ns': 0, 'pid': 999999}
+    done, _, _, tail = Processes().poll(job)
+    assert done
+    assert tail.startswith('codex exec exited 2: unexpected argument --foo\n')
+
+
+def test_show_run_folder_and_final(tmp_path, make_state, monkeypatch, capsys):
+    path = make_state()
+    runs = tmp_path / 'runs'
+    monkeypatch.setenv('CPLANE_RUNS', str(runs))
+    from cplane.cli import main as cli_main
+    import hashlib
+    folder = runs / hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:20] / 'run-1'
+    folder.mkdir(parents=True)
+    atomic = {'id': 'voice/W1', 'tool': 'codex', 'started_ns': 1,
+              'final': {'kind': 'handover', 'body': 'Ready for review'}}
+    (folder / 'job.json').write_text(json.dumps(atomic))
+    assert cli_main(['--state', str(path), 'show', 'voice/W1']) == 0
+    assert f'run: {folder}' in capsys.readouterr().out
+    assert cli_main(['--state', str(path), 'show', 'voice/W1', '--final']) == 0
+    assert capsys.readouterr().out == 'kind: handover\nbody: Ready for review\n'
 
 
 @pytest.mark.parametrize('checks,expected', [
