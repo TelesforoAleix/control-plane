@@ -161,7 +161,7 @@ def main(argv=None):
         path = Path(path).expanduser()
         if args.command == "install-agent":
             from .agent import install
-            install(path.resolve())
+            install(path.resolve(), commit=getattr(args, "commit", False))
         elif args.command == "run":
             from .runner import Runner
             Runner(path).run()

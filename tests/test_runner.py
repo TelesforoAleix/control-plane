@@ -1,6 +1,7 @@
 import copy
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 import plistlib
 from unittest.mock import Mock
@@ -348,13 +349,14 @@ def test_runner_cli_uses_default_commit(make_state, monkeypatch):
     fake.return_value.run.assert_called_once()
 
 
-def test_plist():
-    data = plistlib.loads(plistlib.dumps(agent.render('/tmp/state.json', home='/tmp/owner', python='/python', environment={})))
+@pytest.mark.parametrize(('commit', 'extra'), [(False, []), (True, ['--commit'])])
+def test_plist(commit, extra):
+    data = plistlib.loads(plistlib.dumps(agent.render('/tmp/state.json', commit=commit, home='/tmp/owner', python='/python', environment={})))
     assert data['AbandonProcessGroup'] is True
     assert data['StartInterval'] == 300
     assert data['StandardOutPath'] == '/tmp/owner/Library/Logs/cplane/runner.log'
     assert data['StandardErrorPath'] == '/tmp/owner/Library/Logs/cplane/runner-error.log'
-    assert data['ProgramArguments'] == ['/python', '-m', 'cplane.cli', '--state', '/tmp/state.json', 'run']
+    assert data['ProgramArguments'] == ['/python', '-m', 'cplane.cli', '--state', '/tmp/state.json', *extra, '--actor', 'runner', 'run']
 
 
 def test_agent_install_uninstall_only_fake_launchctl(tmp_path, monkeypatch):
@@ -368,6 +370,38 @@ def test_agent_install_uninstall_only_fake_launchctl(tmp_path, monkeypatch):
     agent.uninstall()
     assert not plist.exists()
     assert call.call_args.args[0] == 'bootout'
+
+
+def test_agent_replace_waits_for_launchd_before_bootstrap(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent.Path, 'home', lambda: tmp_path)
+    target = tmp_path / 'Library/LaunchAgents/com.cplane.runner.plist'
+    target.parent.mkdir(parents=True)
+    target.write_text('old')
+    listed = iter([0, 0, 113])
+    calls = []
+
+    def launchctl(*args, **kwargs):
+        calls.append(args)
+        if args[0] == 'list':
+            return Mock(returncode=next(listed))
+        return Mock(returncode=0)
+
+    monkeypatch.setattr(agent, 'launchctl', launchctl)
+    monkeypatch.setattr(agent.time, 'sleep', lambda _: calls.append(('sleep',)))
+    agent.install(tmp_path / 'state.json')
+    assert calls == [
+        ('bootout', f'gui/{os.getuid()}', str(target)),
+        ('list', agent.LABEL), ('sleep',), ('list', agent.LABEL), ('sleep',), ('list', agent.LABEL),
+        ('bootstrap', f'gui/{os.getuid()}', str(target)),
+    ]
+
+
+def test_install_agent_passes_commit_flag(make_state, monkeypatch):
+    path = make_state()
+    install = Mock()
+    monkeypatch.setattr(agent, 'install', install)
+    assert main(['--state', str(path), '--commit', 'install-agent']) == 0
+    install.assert_called_once_with(path.resolve(), commit=True)
 
 
 @pytest.mark.parametrize('tool', ['codex', 'claude'])
