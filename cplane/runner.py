@@ -298,6 +298,7 @@ class Runner:
             self.data = state.load(self.path)
             if not self.data["slices"]:
                 return  # Nothing to mutate or commit in an empty scheduler.
+            state_before = json.dumps(self.data, ensure_ascii=False, separators=(',', ':'))
             self.instant = self.clock()
             self.at = self.instant.isoformat()
             self.notices = []
@@ -309,17 +310,15 @@ class Runner:
                     self.jobs[job['id']] = job
             for item in self.data['slices']:
                 if item['state'] == 'accepted':
-                    self.log(item, 'skipped: accepted slice')
                     continue
-                self.log(item, 'pulled state')
                 job = self.jobs.get(item['id'])
                 if job:
-                    before = job['phase']
-                    if (before in ('merged', 'node-step')
+                    phase_before = job['phase']
+                    if (phase_before in ('merged', 'node-step')
                             and not any(e['event'] == 'merged: ' + job['sha'] for e in item['log'])):
                         self.log(item, 'merged: ' + job['sha'], True)
                         item['attention'] = None
-                        if before == 'node-step':
+                        if phase_before == 'node-step':
                             self.attention(item, 'node-step', job['request']['node_steps'])
                     marker = 'collected turn: ' + Path(job['run']).name
                     if (job['phase'] in ('ended', 'collected', 'pr')
@@ -330,7 +329,7 @@ class Runner:
                     else:
                         self.collect(item, job)
                     # PR checks begin on a later pass than the waiting reply.
-                    if before == 'pr':
+                    if phase_before == 'pr':
                         self.pr_checks(item, job)
             for item in self.data['slices']:
                 if item['state'] != 'accepted':
@@ -352,15 +351,15 @@ class Runner:
                         self.launch(item, prompt)
                     except OSError as error:
                         self.attention(item, 'escalation', str(error))
-            for item in self.data['slices']:
-                if item['state'] != 'accepted':
-                    self.log(item, 'save and sync state')
-            state.save(self.path, self.data)
-            outbox = Path(str(self.path) + '.outbox.jsonl')
+            changed = json.dumps(self.data, ensure_ascii=False, separators=(',', ':')) != state_before
+            if changed or self.notices:
+                state.save(self.path, self.data)
             if self.notices:
+                outbox = Path(str(self.path) + '.outbox.jsonl')
                 with outbox.open('a') as stream:
                     for notice in self.notices:
                         stream.write(json.dumps(notice, ensure_ascii=False) + '\n')
                     stream.flush()
                     os.fsync(stream.fileno())
-            self.git.commit(self.path)
+            if changed or self.notices:
+                self.git.commit(self.path)
