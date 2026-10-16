@@ -39,13 +39,13 @@ def command(job):
                 '--output-schema', str(folder / 'schema.json'), '--json', '-o', str(folder / 'last.json')]
         if job.get('resume'):
             args += ['resume', job['resume']]
-        return args + [job['prompt']]
+        return args + ['--', job['prompt']]
     args = ['claude', '-p', '--model', job['model'], '--settings', str(folder / 'sandbox.json'),
             '--permission-mode', 'acceptEdits', '--allowedTools', 'Bash', '--output-format', 'json',
             '--json-schema', json.dumps(FINAL_SCHEMA)]
     if job.get('resume'):
         args += ['--resume', job['resume']]
-    return args + [job['prompt']]
+    return args + ['--', job['prompt']]
 
 
 class Processes:

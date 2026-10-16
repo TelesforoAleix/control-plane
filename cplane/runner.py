@@ -24,7 +24,10 @@ def codex_usage(folder=None):
             try:
                 limits = json.loads(line).get('payload', {}).get('rate_limits')
                 if limits and limits.get('primary'):
-                    return limits['primary']['used_percent']
+                    primary = limits['primary']
+                    if primary.get('resets_at') is not None and primary['resets_at'] <= time.time():
+                        return 0
+                    return primary.get('used_percent')
             except (ValueError, KeyError, TypeError, AttributeError):
                 continue
     return None
@@ -101,6 +104,10 @@ class Runner:
         if notice:
             self.notices.append({'at': self.at, 'id': item['id'], 'event': event.split(':')[0], 'text': event})
 
+    def defer(self, item, reason):
+        if not item['log'] or item['log'][-1]['event'] != reason:
+            self.log(item, reason)
+
     def attention(self, item, kind, body):
         item['attention'] = {'kind': kind, 'body': body, 'since': self.at, 'answer': None, 'approved': False}
         if kind == 'escalation':
@@ -127,8 +134,13 @@ class Runner:
         if usage:
             try:
                 age = self.instant.timestamp() - usage['at']
-                used = usage['rate_limits']['five_hour']['used_percentage']
-                if 0 <= age < 3600 and 0 <= used < 90:
+                window = usage['rate_limits']['five_hour']
+                used = window.get('used_percentage')
+                reset = window.get('resets_at')
+                expired = reset is not None and reset <= self.instant.timestamp()
+                if expired:
+                    used = 0
+                if (expired or 0 <= age < 3600) and isinstance(used, (int, float)) and 0 <= used < 90:
                     return 'claude', model if resume else ('opus' if 'sol' in model.lower() else 'sonnet')
             except (KeyError, TypeError):
                 pass
@@ -160,12 +172,11 @@ class Runner:
     def launch(self, item, prompt, resume=False):
         reason = self.room(item)
         if reason:
-            if not item['log'] or item['log'][-1]['event'] != reason:
-                self.log(item, reason)
+            self.defer(item, reason)
             return False
         choice = self.choose(item, resume)
         if choice is None:
-            self.log(item, 'deferred: capacity unavailable')
+            self.defer(item, 'deferred: capacity unavailable')
             return False
         tool, model = choice
         folder = self.repo(item)
@@ -260,7 +271,7 @@ class Runner:
         attention = item['attention']
         if attention and attention['answer'] is not None:
             if not job or not item['session'] or not item['session']['id']:
-                self.log(item, 'deferred: session unavailable')
+                self.defer(item, 'deferred: session unavailable')
             else:
                 self.launch(item, attention['answer'], resume=True)
             return
@@ -269,10 +280,10 @@ class Runner:
                 if job and item['session']['id']:
                     self.launch(item, 'The owner approves the merge.', resume=True)
                 else:
-                    self.log(item, 'deferred: session unavailable')
+                    self.defer(item, 'deferred: session unavailable')
                 return
             if not job or not item['pr']:
-                self.log(item, 'deferred: PR metadata unavailable')
+                self.defer(item, 'deferred: PR metadata unavailable')
                 return
             status, failing = self.github.checks(item['repo'], item['pr'])
             self.log(item, 'approval checks: ' + status)
@@ -358,6 +369,12 @@ class Runner:
                     try:
                         with brief.open(encoding='utf-8', newline='') as stream:
                             prompt = stream.read()
+                        lines = prompt.splitlines(keepends=True)
+                        if lines and lines[0].rstrip('\r\n') == '---':
+                            closing = next((i for i in range(1, len(lines))
+                                            if lines[i].rstrip('\r\n') == '---'), None)
+                            if closing is not None:
+                                prompt = ''.join(lines[closing + 1:])
                         self.launch(item, prompt)
                     except OSError as error:
                         self.attention(item, 'escalation', str(error))

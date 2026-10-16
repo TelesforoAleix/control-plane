@@ -142,6 +142,21 @@ def test_missing_capacity_defers(setup):
     assert not p.started
 
 
+def test_capacity_unavailable_deferral_is_logged_once(setup):
+    r, _, _ = setup
+    r.codex_reader = lambda: None
+    r.claude_reader = lambda: None
+    r.at = NOW.isoformat()
+    candidate = item(r)
+    r.data = state.load(r.path)
+    candidate = r.data['slices'][0]
+    r.jobs = {}
+    r.instant = NOW
+    r.launch(candidate, 'prompt')
+    r.launch(candidate, 'prompt')
+    assert [entry['event'] for entry in candidate['log']] == ['deferred: capacity unavailable']
+
+
 @pytest.mark.parametrize('repos,count', [(['repo', 'repo', 'third'], 2), (['repo', 'second', 'third'], 2)])
 def test_running_limits(setup, repos, count):
     r, p, _ = setup
@@ -463,11 +478,13 @@ def test_install_agent_passes_commit_flag(make_state, monkeypatch):
 
 
 @pytest.mark.parametrize('tool', ['codex', 'claude'])
-def test_executor_arguments(tool, tmp_path):
-    job = {'tool': tool, 'run': str(tmp_path), 'repo': '/tmp/repo', 'model': 'model', 'prompt': 'literal $(touch nope)', 'resume': 'session'}
+@pytest.mark.parametrize('resume', [None, 'session'])
+def test_executor_arguments(tool, resume, tmp_path):
+    job = {'tool': tool, 'run': str(tmp_path), 'repo': '/tmp/repo', 'model': 'model', 'prompt': '-literal prompt', 'resume': resume}
     args = command(job)
-    assert args[-1] == job['prompt']
-    assert 'session' in args
+    assert args[-2:] == ['--', job['prompt']]
+    if resume:
+        assert 'session' in args
     if tool == 'codex':
         assert 'sandbox_mode="workspace-write"' in args
         assert 'sandbox_workspace_write.network_access=true' in args
@@ -579,6 +596,49 @@ def test_codex_usage_latest_nonnull_report(tmp_path, monkeypatch):
         '{"payload":{"rate_limits":{"primary":{"used_percent":34}}}}',
         '{"payload":{"rate_limits":null}}', 'not json']))
     assert codex_usage(folder) == 34
+
+
+def test_codex_usage_expired_window_is_free(tmp_path, monkeypatch):
+    from cplane.runner import codex_usage
+    folder = tmp_path / 'sessions'
+    folder.mkdir()
+    (folder / 'session.jsonl').write_text(json.dumps({'payload': {'rate_limits': {
+        'primary': {'used_percent': 100, 'resets_at': NOW.timestamp() - 1}}}}))
+    monkeypatch.setattr('cplane.runner.time.time', lambda: NOW.timestamp())
+    assert codex_usage(folder) == 0
+
+
+@pytest.mark.parametrize('tool', ['codex', 'claude'])
+def test_brief_frontmatter_and_option_like_prompt_are_passed_after_separator(setup, tool):
+    r, p, _ = setup
+    (r.path.parent / 'briefs/W1.md').write_text('---\nstatus: ready\n---\n- begin with an option-like line\n')
+    if tool == 'claude':
+        r.codex_reader = lambda: 100
+        r.claude_reader = lambda: {'at': NOW.timestamp(), 'rate_limits': {'five_hour': {'used_percentage': 1}}}
+    r.run()
+    assert p.started[0]['prompt'] == '- begin with an option-like line\n' + (CLAUDE_PARAGRAPH if tool == 'claude' else '')
+    from cplane.executors import command
+    args = command(p.started[0])
+    assert args[-2:] == ['--', p.started[0]['prompt']]
+    assert args[-2] == '--'
+
+
+def test_null_claude_percentage_is_unknown(setup):
+    r, p, _ = setup
+    r.codex_reader = lambda: 100
+    r.claude_reader = lambda: {'at': NOW.timestamp(), 'rate_limits': {'five_hour': {'used_percentage': None}}}
+    r.run()
+    assert not p.started
+
+
+def test_expired_claude_window_is_free_even_with_old_usage_file(setup):
+    r, p, _ = setup
+    r.codex_reader = lambda: 100
+    r.claude_reader = lambda: {'at': NOW.timestamp() - 7200, 'rate_limits': {'five_hour': {
+        'used_percentage': 100, 'resets_at': NOW.timestamp() - 1}}}
+    r.run()
+    assert len(p.started) == 1
+    assert p.started[0]['tool'] == 'claude'
 
 
 def test_usage_unavailable_or_malformed(tmp_path, monkeypatch):
