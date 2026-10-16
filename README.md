@@ -201,7 +201,9 @@ resolve as `$CPLANE_REPOS/<repository-name>` (default `~/Code`). Existing owner
 commands, the version 1 schema, and the outbox format are unchanged.
 
 A slice starts when ready, unpaused, at or after its slot, with every dependency
-accepted. Codex uses the slice's model when its latest five-hour usage is below
+accepted. Accepted slices are skipped with a log entry on each pass; the runner
+does not start, resume, deliver to, merge for, or collect into them, including when
+saved jobs or attention remain. Codex uses the slice's model when its latest five-hour usage is below
 100%. Otherwise Claude uses opus for a Sol model and sonnet for other models,
 provided its usage file is less than an hour old and below 90% for five hours.
 Missing usage is unavailable capacity. The next pass retries deferred work.
