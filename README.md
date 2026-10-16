@@ -4,6 +4,8 @@ A scheduler's state file and its commands. `cplane` helps an owner schedule slic
 coding work, answer questions, approve merges, and see what is pending. It records
 intent through owner commands. `start` sets a slot to now; `resume` clears a pause
 flag. The separate `run` command starts and resumes Codex and Claude executors.
+Planning agents use `add`, `edit`, `state`, `attention`, and `show` to prepare
+briefs, mark slices ready, review handovers, and accept completed work.
 
 Requires Python 3.13 or later and uv. Install the locked environment with `uv sync`.
 The only direct runtime dependency is the MIT-licensed `jsonschema` library.
@@ -13,6 +15,10 @@ uv run cplane --help
 export CPLANE_STATE=/path/to/state.json
 uv run cplane pending
 uv run cplane pending --json
+uv run cplane --actor planner add --id example/W2 --repo example/project --feature example --title 'Next slice' --brief briefs/W2.md
+uv run cplane --actor planner edit example/W2 --depends-on example/W1
+uv run cplane --actor planner state example/W2 ready
+uv run cplane show example/W2 --json
 uv run cplane slot example/W1 'Mon 03:00'
 uv run cplane slot example/W1 'tomorrow 06:00'
 uv run cplane unslot example/W1
@@ -27,6 +33,60 @@ uv run cplane --actor owner --commit slot example/W1 '2026-10-19T03:00:00+02:00'
 `--state PATH` overrides `CPLANE_STATE`. Global options may appear before or after
 the command. The state file must already exist. It belongs to a separate repository;
 this repository contains only the schema and synthetic test fixtures.
+
+| Command | Purpose |
+| --- | --- |
+| `pending [--json]` | List pending slices by group. |
+| `show <id> [--json]` | Print one complete slice, including its log. |
+| `add --id <id> --repo <repo> --feature <text> --title <text> [options]` | Add a planned slice; refuse an existing ID. |
+| `edit <id> [options]` | Change only the supplied fields. |
+| `state <id> <state> [--session <tool>:<id>:<folder>] [--force --reason <text>]` | Record an allowed state transition. Quote states containing spaces. |
+| `attention <id> --kind <kind> --body <text>` | Record attention and append a notice. |
+| `attention <id> --clear` | Clear attention. |
+| `slot <id> <when>` / `unslot <id>` | Record or clear a scheduled time. |
+| `start <id>` | Slot a ready slice now. |
+| `pause <id>` / `resume <id>` | Set or clear the pause flag. |
+| `approve <id>` / `answer <id> <text>` | Approve merge attention or answer a question/escalation. |
+| `run` | Make one runner pass. |
+| `install-agent` / `uninstall-agent` | Install or remove the launchd runner. |
+
+`add` and `edit` accept `--repo`, `--feature`, `--title`, `--brief`,
+`--tool codex|claude`, `--model`, `--stop-before-merge` (or
+`--no-stop-before-merge`), and `--depends-on <id> …`. Dependencies replace the
+list; `--depends-on` with no IDs clears it, and repeated occurrences extend the
+replacement list. `edit` also accepts `--id` to change the ID; references in other
+slices are left as recorded. IDs remain unique. While issued or awaiting handover,
+only the title and dependencies can be edited.
+
+New slices default to executor `codex` / `gpt-6.1-sol`, no brief, no dependencies,
+`stop_before_merge` and `paused` false, and null slot, session, PR, and attention.
+The command creates the first log entry. Brief paths are stored without reading
+the file. A brief must be set before moving to ready.
+
+Allowed state transitions are:
+
+| From | To |
+| --- | --- |
+| planned | researching, ready |
+| researching | planned, ready |
+| ready | planned (clears slot), issued (requires `--session`) |
+| issued, awaiting handover | in review, escalated, awaiting handover |
+| escalated | issued |
+| in review | accepted, issued |
+
+Every other transition is refused with a reason. From any state,
+`state <id> planned --force --reason <text>` resets to planned and clears the
+slot; the nonempty reason is recorded in the log. Other fields remain recorded.
+`--session` is allowed only for ready → issued and records an executor already
+started outside the runner; this command starts no process. The tool must be codex
+or claude, and both ID and folder must be nonempty. Folder paths may contain colons.
+State log events include the destination and any forced-reset reason.
+
+Attention kinds are `question`, `escalation`, `merge`, `node-step`, and
+`owner-check`. Setting attention replaces its body and timestamp, clears its
+answer and approval, and leaves the slice's state as recorded. Clearing attention
+adds no notice. All planner writes accept `--actor` (default `owner`) and
+`--commit`, like the owner commands. `show --json` returns one slice object.
 
 The version 1 shape is defined in [schema/slices.schema.json](schema/slices.schema.json)
 (JSON Schema draft 2020-12). The loader additionally checks uniqueness of slice IDs,
@@ -61,7 +121,7 @@ A minimal synthetic state file:
 
 `slot` and `start` require `ready`. They name every unmet dependency in a warning
 but still record the slot. `approve` requires merge attention; `answer` requires
-question or escalation attention. Other mutations apply to any existing slice,
+question or escalation attention. Other owner mutations apply to any existing slice,
 including repeated calls. Refusals exit nonzero with one line on stderr and leave
 the state unchanged. A warning accompanies a successful command and exits zero.
 
@@ -92,7 +152,7 @@ to `owner`; the event is the command name. A stable sidecar lock serializes writ
 across replacement of the state file. Existing state permissions are preserved.
 Readers see a complete old or new state file.
 
-`slot`, `start`, `approve`, and `answer` also append one JSON line containing
+`slot`, `start`, `approve`, `answer`, and setting `attention` also append one JSON line containing
 `{at, id, event, text}` to `<state>.outbox.jsonl` under the same lock. Nothing sends
 these notices. State replacement and outbox append are separate filesystem
 operations: an I/O failure or crash between them can leave a saved state without
