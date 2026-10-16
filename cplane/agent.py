@@ -4,13 +4,14 @@ from pathlib import Path
 import plistlib
 import subprocess
 import sys
+import time
 
 from .state import StateError
 
 LABEL = 'com.cplane.runner'
 
 
-def render(path, *, home=None, python=None, environment=None):
+def render(path, *, commit=False, home=None, python=None, environment=None):
     home = Path(home or Path.home())
     logs = home / 'Library/Logs/cplane'
     source = environment if environment is not None else os.environ
@@ -19,7 +20,8 @@ def render(path, *, home=None, python=None, environment=None):
     env.setdefault('PATH', '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin')
     return {
         'Label': LABEL,
-        'ProgramArguments': [str(python or sys.executable), '-m', 'cplane.cli', '--state', str(path), 'run'],
+        'ProgramArguments': [str(python or sys.executable), '-m', 'cplane.cli', '--state', str(path),
+                             *(('--commit',) if commit else ()), '--actor', 'runner', 'run'],
         'WorkingDirectory': str(Path(__file__).resolve().parent.parent),
         'EnvironmentVariables': env,
         'StartInterval': 300,
@@ -33,16 +35,19 @@ def launchctl(*args, missing_ok=False):
     result = subprocess.run(['launchctl', *args], capture_output=True, text=True)
     if result.returncode and not missing_ok:
         raise StateError('launchctl: ' + (result.stderr.strip() or result.stdout.strip()))
+    return result
 
 
-def install(path):
+def install(path, *, commit=False):
     home = Path.home()
     target = home / 'Library/LaunchAgents' / (LABEL + '.plist')
     target.parent.mkdir(parents=True, exist_ok=True)
     (home / 'Library/Logs/cplane').mkdir(parents=True, exist_ok=True)
     if target.exists():
         launchctl('bootout', f'gui/{os.getuid()}', str(target), missing_ok=True)
-    target.write_bytes(plistlib.dumps(render(path)))
+        while launchctl('list', LABEL, missing_ok=True).returncode == 0:
+            time.sleep(0.1)
+    target.write_bytes(plistlib.dumps(render(path, commit=commit)))
     launchctl('bootstrap', f'gui/{os.getuid()}', str(target))
 
 
