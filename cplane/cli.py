@@ -1,6 +1,7 @@
 """Owner and planner commands for the scheduling state file."""
 import argparse
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -114,6 +115,7 @@ def parser():
     show = commands.add_parser("show", parents=[common], help="show one complete slice")
     show.add_argument("id")
     show.add_argument("--json", action="store_true", help="output slice JSON")
+    show.add_argument("--final", action="store_true", help="show the latest final message")
     for command in ("add", "edit"):
         sub = commands.add_parser(command, parents=[common], help=f"{command} a slice")
         if command == "edit":
@@ -172,8 +174,39 @@ def main(argv=None):
             item = next((item for item in state.load(path)["slices"] if item["id"] == args.id), None)
             if item is None:
                 raise state.StateError(f"unknown slice: {args.id}")
-            print(json.dumps(item, indent=2, ensure_ascii=False) if args.json else
-                  "\n".join(f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in item.items()))
+            base = Path(os.environ.get('CPLANE_RUNS', '~/Library/Application Support/cplane/runs')).expanduser().resolve()
+            runs = base / hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:20]
+            latest = None
+            for job_path in runs.glob('*/job.json'):
+                try:
+                    job = json.loads(job_path.read_text())
+                except (OSError, ValueError):
+                    continue
+                if job.get('id') == args.id and (latest is None or job.get('started_ns', 0) > latest[0]):
+                    latest = (job.get('started_ns', 0), job_path.parent, job)
+            if args.final:
+                if latest is None:
+                    print('final: unavailable (no run recorded)')
+                else:
+                    job = latest[2]
+                    final = job.get('final')
+                    last = latest[1] / ('last.json' if job.get('tool') == 'codex' else 'claude.json')
+                    if not final and last.exists():
+                        try:
+                            reply = json.loads(last.read_text())
+                            final = reply if job.get('tool') == 'codex' else reply.get('structured_output')
+                        except (OSError, ValueError, AttributeError):
+                            final = None
+                    if isinstance(final, dict) and isinstance(final.get('kind'), str) and isinstance(final.get('body'), str):
+                        print(f"kind: {final['kind']}\nbody: {final['body']}")
+                    else:
+                        print('final: unavailable')
+            elif args.json:
+                print(json.dumps(item, indent=2, ensure_ascii=False))
+            else:
+                details = "\n".join(f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in item.items())
+                folder = str(latest[1]) if latest else '(none)'
+                print(details + f'\nrun: {folder}')
         elif args.command in ("add", "edit", "state", "attention"):
             event = None
             if args.command == "state":

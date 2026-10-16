@@ -115,6 +115,17 @@ class Processes:
         if errors.exists():
             lines += errors.read_text(errors='replace').splitlines()
         tail = '\n'.join(lines[-40:])
+        if done:
+            exit_file = folder / 'exit.json'
+            if exit_file.exists():
+                try:
+                    code = json.loads(exit_file.read_text()).get('code', 1)
+                except (ValueError, OSError, AttributeError):
+                    code = 1
+                error_lines = errors.read_text(errors='replace').splitlines() if errors.exists() else []
+                first_error = next((line.strip() for line in error_lines if line.strip()), 'no stderr output')
+                tool = 'codex' if job['tool'] == 'codex' else 'claude'
+                tail = f'{tool} exec exited {code}: {first_error}' + ('\n' + tail if tail else '')
         return done, session, final if valid else None, tail
 
 

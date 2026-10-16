@@ -50,6 +50,11 @@ class Git:
     def commit(self, path):
         state.commit_state(path, Path(str(path) + '.outbox.jsonl'), 'run', 'pass')
 
+    def branch(self, path):
+        result = subprocess.run(['git', '-C', str(path), 'branch', '--show-current'],
+                                capture_output=True, text=True)
+        return result.stdout.strip() if result.returncode == 0 else ''
+
 
 class GitHub:
     def call(self, repo, *args):
@@ -65,6 +70,16 @@ class GitHub:
             return existing[0]['number']
         url = self.call(repo, 'pr', 'create', '--head', request['branch'], '--title', request['title'], '--body', request['body'])
         return int(url.rstrip('/').split('/')[-1])
+
+    def find_pr(self, repo, branch):
+        if not branch:
+            return None
+        prs = json.loads(self.call(repo, 'pr', 'list', '--head', branch, '--state', 'all',
+                                   '--json', 'number,createdAt'))
+        if not prs:
+            return None
+        newest = max(prs, key=lambda pr: pr.get('createdAt', ''))
+        return newest['number']
 
     def checks(self, repo, number):
         info = json.loads(self.call(repo, 'pr', 'view', str(number), '--json', 'statusCheckRollup'))
@@ -225,8 +240,19 @@ class Runner:
 
     def apply_final(self, item, job):
         final = job.get('final')
+        if job['tool'] == 'codex' and final and item['pr'] is None:
+            branch = self.git.branch(job['repo'])
+            item['pr'] = self.github.find_pr(item['repo'], branch)
+            if item['pr'] is None:
+                named = re.findall(r'(?:/pull/|\bPR\s+#)(\d+)', final['body'], re.I)
+                if named:
+                    item['pr'] = int(named[-1])
         if not final:
-            self.attention(item, 'escalation', 'the run ended without a final message\n\n' + job.get('tail', ''))
+            tail = job.get('tail', '')
+            first, _, rest = tail.partition('\n')
+            summary = first if re.match(r'(?:codex|claude) exec exited \d+: ', first) else 'the run ended without a final message'
+            detail = rest if summary == first else tail
+            self.attention(item, 'escalation', summary + ('\n\n' + detail if detail else ''))
         elif final['kind'] == 'handover':
             item['state'], item['attention'] = 'in review', None
             self.log(item, 'finished', True)

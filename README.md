@@ -37,7 +37,7 @@ this repository contains only the schema and synthetic test fixtures.
 | Command | Purpose |
 | --- | --- |
 | `pending [--json]` | List pending slices by group. |
-| `show <id> [--json]` | Print one complete slice, including its log. |
+| `show <id> [--json] [--final]` | Print a slice and newest run folder, or its latest final message. |
 | `add --id <id> --repo <repo> --feature <text> --title <text> [options]` | Add a planned slice; refuse an existing ID. |
 | `edit <id> [options]` | Change only the supplied fields. |
 | `state <id> <state> [--session <tool>:<id>:<folder>] [--force --reason <text>]` | Record an allowed state transition. Quote states containing spaces. |
@@ -227,7 +227,8 @@ delivers it subject to capacity and concurrency limits.
 A handover moves the slice to `in review` and emits `finished`. Questions and
 escalations create attention; an escalation sets `escalated`. Ordinary waiting
 messages create node-step attention. A terminated turn without a valid, fresh
-final message raises escalation with the last 40 log lines. All runner actions
+final message raises escalation with a summary of the tool, exit code and first
+stderr error line, followed by the last 40 log lines. All runner actions
 append log entries with actor `runner`. Notices go to the existing local outbox;
 there is no external notification sender.
 
@@ -235,11 +236,15 @@ The detached supervisor writes executor output, final replies, session IDs, exit
 markers and private turn metadata under `CPLANE_RUNS` (default
 `~/Library/Application Support/cplane/runs`). Each state path has its own directory,
 with one subdirectory per turn. Session IDs are recorded when they appear in the
-executor output; the initial session ID can be empty until collection. Codex final
-files must be newer than the turn's start; Claude replies come from
+executor output, even while a turn is running. When a Codex turn is collected,
+the runner records the PR number for the repository's current branch when one
+exists. Codex final files must be newer than the turn's start; Claude replies come from
 `structured_output`. Run metadata supports collection across CLI restarts. Keep
 these files private like state and outbox: they contain prompts and answers.
 Do not delete them while a turn is active. Retain the same absolute state path.
+
+`show <id>` names the newest run folder; `show <id> --final` prints that run's
+final kind and body.
 
 `install-agent` writes and bootstraps `~/Library/LaunchAgents/com.cplane.runner.plist`.
 It uses the current Python environment and checkout, an absolute state path,
