@@ -684,3 +684,57 @@ def test_empty_state_is_successful_without_an_empty_git_commit(setup):
     r.git.pull.assert_called_once_with(r.path)
     r.git.commit.assert_not_called()
     assert not p.started
+
+
+@pytest.mark.parametrize('phase', [None, 'running', 'ended', 'collected', 'pr', 'merged', 'node-step'])
+@pytest.mark.parametrize('attention_kind', [None, 'question', 'merge'])
+@pytest.mark.parametrize('tool', ['codex', 'claude'])
+def test_accepted_slices_only_log_skip(setup, phase, attention_kind, tool):
+    r, p, gh = setup
+    attention = None if attention_kind is None else {
+        'kind': attention_kind, 'body': 'Review this', 'since': NOW.isoformat(),
+        'answer': 'An answer to deliver' if attention_kind == 'question' else None,
+        'approved': attention_kind == 'merge',
+    }
+    edit(r, lambda s: s.update(
+        state='accepted', session={'tool': tool, 'id': 'accepted-session', 'folder': str(r.repos / 'repo')},
+        attention=attention, pr=12, stop_before_merge=False,
+    ))
+    job_path = None
+    if phase is not None:
+        run = r.runs / 'accepted-job'
+        run.mkdir(parents=True)
+        job = {
+            'id': 'voice/W1', 'phase': phase, 'run': str(run), 'tool': tool,
+            'repo': str(r.repos / 'repo'), 'session': 'stale-session',
+            'model': 'example-model', 'started_ns': 1, 'sha': 'abc123',
+            'request': {'branch': 'feat/example', 'title': 'Example', 'body': 'Change',
+                        'node_steps': 'Owner node work'},
+            'final': {'kind': 'waiting', 'body': pr_reply('Owner node work')}, 'tail': '',
+        }
+        r.save_job(job)
+        job_path = run / 'job.json'
+        job_before = job_path.read_bytes()
+        p.results[str(run)] = (True, 'stale-session', {'kind': 'handover', 'body': 'done'}, '')
+    p.start = Mock(wraps=p.start)
+    p.poll = Mock(wraps=p.poll)
+    gh.checks.return_value = 'green', ''
+    before = item(r)
+    for pass_number in (1, 2):
+        r.run()
+        after = item(r)
+        assert {k: v for k, v in after.items() if k != 'log'} == {
+            k: v for k, v in before.items() if k != 'log'
+        }
+        assert after['log'] == before['log'] + [
+            {'at': NOW.isoformat(), 'actor': 'runner', 'event': 'skipped: accepted slice'}
+        ] * pass_number
+        p.start.assert_not_called()
+        p.poll.assert_not_called()
+        gh.open.assert_not_called()
+        gh.checks.assert_not_called()
+        gh.merge.assert_not_called()
+        assert not r.notices
+        assert not Path(str(r.path) + '.outbox.jsonl').exists()
+        if job_path:
+            assert job_path.read_bytes() == job_before

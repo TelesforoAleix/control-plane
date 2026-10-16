@@ -308,6 +308,9 @@ class Runner:
                 if previous is None or previous['started_ns'] < job['started_ns']:
                     self.jobs[job['id']] = job
             for item in self.data['slices']:
+                if item['state'] == 'accepted':
+                    self.log(item, 'skipped: accepted slice')
+                    continue
                 self.log(item, 'pulled state')
                 job = self.jobs.get(item['id'])
                 if job:
@@ -330,7 +333,8 @@ class Runner:
                     if before == 'pr':
                         self.pr_checks(item, job)
             for item in self.data['slices']:
-                self.deliver(item)
+                if item['state'] != 'accepted':
+                    self.deliver(item)
             accepted = {s['id'] for s in self.data['slices'] if s['state'] == 'accepted'}
             for item in self.data['slices']:
                 if (item['state'] == 'ready' and not item['paused'] and item['slot']
@@ -349,7 +353,8 @@ class Runner:
                     except OSError as error:
                         self.attention(item, 'escalation', str(error))
             for item in self.data['slices']:
-                self.log(item, 'save and sync state')
+                if item['state'] != 'accepted':
+                    self.log(item, 'save and sync state')
             state.save(self.path, self.data)
             outbox = Path(str(self.path) + '.outbox.jsonl')
             if self.notices:

@@ -84,7 +84,7 @@ def commit_state(path, outbox, command, slice_id):
     raise StateError(f"git sync failed after 3 attempts; local commit retained: {last_error}")
 
 
-def update(path, slice_id, command, actor, change, commit=False):
+def update(path, slice_id, command, actor, change, commit=False, *, create=None, event=None):
     path = Path(path).expanduser().resolve()
     outbox = Path(str(path) + ".outbox.jsonl")
     # A stable sidecar inode is necessary: locking the replaced file loses exclusion.
@@ -92,11 +92,16 @@ def update(path, slice_id, command, actor, change, commit=False):
         fcntl.flock(lock, fcntl.LOCK_EX)
         data = load(path)
         item = next((item for item in data["slices"] if item["id"] == slice_id), None)
-        if item is None:
+        if create is not None:
+            if item is not None:
+                raise StateError(f"slice already exists: {slice_id}")
+            item = create()
+            data["slices"].append(item)
+        elif item is None:
             raise StateError(f"unknown slice: {slice_id}")
         at = now().isoformat()
         notice, warning = change(item, data, at)
-        item["log"].append({"at": at, "actor": actor, "event": command})
+        item["log"].append({"at": at, "actor": actor, "event": event or command})
         save(path, data)
         if notice is not None:
             with outbox.open("a") as stream:

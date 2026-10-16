@@ -1,4 +1,4 @@
-"""Owner commands for the scheduling state file."""
+"""Owner and planner commands for the scheduling state file."""
 import argparse
 from datetime import datetime
 import json
@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 
 from . import state
+from . import planner
 from .times import LOCAL, parse_when
 
 
@@ -110,6 +111,32 @@ def parser():
     commands = root.add_subparsers(dest="command", required=True, parser_class=Parser)
     view = commands.add_parser("pending", parents=[common], help="show pending slices")
     view.add_argument("--json", action="store_true", help="output grouped JSON")
+    show = commands.add_parser("show", parents=[common], help="show one complete slice")
+    show.add_argument("id")
+    show.add_argument("--json", action="store_true", help="output slice JSON")
+    for command in ("add", "edit"):
+        sub = commands.add_parser(command, parents=[common], help=f"{command} a slice")
+        if command == "edit":
+            sub.add_argument("id")
+            sub.add_argument("--id", dest="new_id", default=argparse.SUPPRESS)
+        else:
+            sub.add_argument("--id", required=True)
+        for field in ("repo", "feature", "title", "brief", "model"):
+            sub.add_argument(f"--{field}", required=command == "add" and field in ("repo", "feature", "title"), default=argparse.SUPPRESS)
+        sub.add_argument("--tool", choices=("codex", "claude"), default=argparse.SUPPRESS)
+        sub.add_argument("--stop-before-merge", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS)
+        sub.add_argument("--depends-on", nargs="*", action="extend", default=argparse.SUPPRESS, metavar="ID")
+    move = commands.add_parser("state", parents=[common], help="move a slice between planning states")
+    move.add_argument("id")
+    move.add_argument("target", metavar="state")
+    move.add_argument("--session")
+    move.add_argument("--force", action="store_true")
+    move.add_argument("--reason")
+    attention = commands.add_parser("attention", parents=[common], help="record or clear attention")
+    attention.add_argument("id")
+    attention.add_argument("--kind", choices=planner.KINDS)
+    attention.add_argument("--body")
+    attention.add_argument("--clear", action="store_true")
     helps = {"slot": "schedule a ready slice", "unslot": "clear a slot", "start": "slot a ready slice now", "pause": "set paused", "resume": "clear paused", "approve": "approve merge attention", "answer": "answer a question or escalation"}
     for command in COMMANDS:
         sub = commands.add_parser(command, parents=[common], help=helps[command])
@@ -141,6 +168,22 @@ def main(argv=None):
         elif args.command == "pending":
             groups = pending(state.load(path))
             print(json.dumps(groups, indent=2, ensure_ascii=False) if args.json else render(groups))
+        elif args.command == "show":
+            item = next((item for item in state.load(path)["slices"] if item["id"] == args.id), None)
+            if item is None:
+                raise state.StateError(f"unknown slice: {args.id}")
+            print(json.dumps(item, indent=2, ensure_ascii=False) if args.json else
+                  "\n".join(f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in item.items()))
+        elif args.command in ("add", "edit", "state", "attention"):
+            event = None
+            if args.command == "state":
+                event = f"state: {args.target}"
+                if args.force:
+                    event += f" (forced: {args.reason})"
+            state.update(path, args.id, args.command, getattr(args, "actor", "owner"),
+                         planner.change_for(args), getattr(args, "commit", False),
+                         create=(lambda: planner.new_slice(args.id)) if args.command == "add" else None,
+                         event=event)
         else:
             warning = state.update(path, args.id, args.command, getattr(args, "actor", "owner"), change_for(args.command, getattr(args, "value", None)), getattr(args, "commit", False))
             if warning:

@@ -131,3 +131,23 @@ def test_pull_retries(git_state, monkeypatch, failures):
     else:
         state.update(path, "voice/W1", "pause", "owner", change_for("pause"), commit=True)
     assert attempts == 3
+
+
+@pytest.mark.parametrize('command', ['add', 'edit', 'state', 'attention'])
+def test_planner_commit_and_push(git_state, command):
+    path, remote, _ = git_state
+    args = {
+        'add': ['add', '--id', 'new/W2', '--repo', 'example/repo', '--feature', 'new', '--title', 'New slice'],
+        'edit': ['edit', 'voice/W1', '--title', 'Updated title'],
+        'state': ['state', 'voice/W1', 'planned', '--force', '--reason', 'Replan'],
+        'attention': ['attention', 'voice/W1', '--kind', 'owner-check', '--body', 'Review this'],
+    }[command]
+    assert main(['--state', str(path), '--commit', '--actor', 'planner', *args]) == 0
+    assert git(remote, 'rev-parse', 'main') == git(path.parent, 'rev-parse', 'HEAD')
+    data = json.loads(git(remote, 'show', 'main:slices.json'))
+    item = data['slices'][-1] if command == 'add' else data['slices'][0]
+    assert item['log'][-1]['actor'] == 'planner'
+    assert git(remote, 'log', '-1', '--format=%s') == f"cplane: {command} {item['id']}"
+    if command == 'attention':
+        notice = json.loads(git(remote, 'show', 'main:slices.json.outbox.jsonl'))
+        assert notice['event'] == 'attention'
