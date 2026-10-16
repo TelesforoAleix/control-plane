@@ -30,12 +30,25 @@ def atomic_json(path, data):
     temp.replace(path)
 
 
+def cache_roots():
+    home = Path.home()
+    return [str((home / path).resolve()) for path in ('.cache/uv', '.npm')
+            if (home / path).is_dir()]
+
+
+def claude_settings():
+    settings = json.loads(json.dumps(CLAUDE_SETTINGS))
+    settings['sandbox']['filesystem'] = {'allowWrite': cache_roots()}
+    return settings
+
+
 def command(job):
     folder = Path(job['run'])
     if job['tool'] == 'codex':
         args = ['codex', 'exec', '-m', job['model'], '-c', 'sandbox_mode="workspace-write"',
                 '-c', 'sandbox_workspace_write.network_access=true',
-                '-c', 'sandbox_workspace_write.writable_roots=' + json.dumps([str(Path(job['repo']) / '.git')]),
+                '-c', 'sandbox_workspace_write.writable_roots=' + json.dumps(
+                    [str(Path(job['repo']) / '.git'), *cache_roots()]),
                 '--output-schema', str(folder / 'schema.json'), '--json', '-o', str(folder / 'last.json')]
         if job.get('resume'):
             args += ['resume', job['resume']]
@@ -52,7 +65,7 @@ class Processes:
     def start(self, job):
         folder = Path(job['run'])
         atomic_json(folder / 'schema.json', FINAL_SCHEMA)
-        atomic_json(folder / 'sandbox.json', CLAUDE_SETTINGS)
+        atomic_json(folder / 'sandbox.json', claude_settings())
         atomic_json(folder / 'request.json', job)
         # The supervisor is outside the CLI process group and closes all terminal FDs.
         with (folder / 'supervisor.log').open('ab') as log:
