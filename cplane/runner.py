@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
+import traceback
 import uuid
 
 from . import state
@@ -57,8 +58,19 @@ class Git:
 
 
 class GitHub:
+    def repository(self, path):
+        result = subprocess.run(['git', '-C', str(path), 'remote', 'get-url', 'origin'],
+                                text=True, capture_output=True)
+        remote = result.stdout.strip()
+        if result.returncode or not remote:
+            raise state.StateError(f'missing GitHub origin: {path}')
+        match = re.fullmatch(r'(?:https://|ssh://git@|git@)(?:github\.com[:/])([^/]+)/([^/]+?)(?:\.git)?', remote)
+        if not match:
+            raise state.StateError(f'origin is not a GitHub repository: {remote}')
+        return f'{match.group(1)}/{match.group(2)}'
+
     def call(self, repo, *args):
-        result = subprocess.run(['gh', *args, '--repo', repo], text=True, capture_output=True)
+        result = subprocess.run(['gh', *args, '-R', repo], text=True, capture_output=True)
         if result.returncode:
             raise state.StateError('gh: ' + (result.stderr.strip() or result.stdout.strip()))
         return result.stdout.strip()
@@ -128,6 +140,15 @@ class Runner:
         if kind == 'escalation':
             item['state'] = 'escalated'
         self.log(item, f'{kind}: {body}', True)
+        self.log(item, f'{kind}: {body}', True)
+
+    def slice_failure(self, item, stage):
+        lines = traceback.format_exc().strip().splitlines()
+        summary = f'{stage} failed: {lines[-1] if lines else "unknown error"}'
+        self.attention(item, 'escalation', summary + ('\n' + '\n'.join(lines[-8:]) if lines else ''))
+
+    def github_repo(self, item):
+        return self.github.repository(self.repo(item))
 
     def save_job(self, job):
         atomic_json(Path(job['run']) / 'job.json', job)
@@ -242,7 +263,7 @@ class Runner:
         final = job.get('final')
         if job['tool'] == 'codex' and final and item['pr'] is None:
             branch = self.git.branch(job['repo'])
-            item['pr'] = self.github.find_pr(item['repo'], branch)
+            item['pr'] = self.github.find_pr(self.github_repo(item), branch)
             if item['pr'] is None:
                 named = re.findall(r'(?:/pull/|\bPR\s+#)(\d+)', final['body'], re.I)
                 if named:
@@ -272,7 +293,7 @@ class Runner:
                 self.attention(item, 'escalation', 'invalid Claude PR request: ' + str(error))
             else:
                 job['request'], job['phase'] = request, 'pr'
-                item['pr'] = self.github.open(item['repo'], request)
+                item['pr'] = self.github.open(self.github_repo(item), request)
                 self.log(item, f'opened PR: {item["pr"]}', True)
         else:
             self.attention(item, 'node-step', final['body'])
@@ -282,7 +303,7 @@ class Runner:
         self.save_job(job)
 
     def merge(self, item, job):
-        sha = self.github.merge(item['repo'], item['pr'])
+        sha = self.github.merge(self.github_repo(item), item['pr'])
         job['phase'], job['sha'] = 'merged', sha
         self.save_job(job)
         self.log(item, f'merged: {sha}', True)
@@ -311,7 +332,7 @@ class Runner:
             if not job or not item['pr']:
                 self.defer(item, 'deferred: PR metadata unavailable')
                 return
-            status, failing = self.github.checks(item['repo'], item['pr'])
+            status, failing = self.github.checks(self.github_repo(item), item['pr'])
             self.log(item, 'approval checks: ' + status)
             if status == 'red':
                 self.attention(item, 'escalation', 'failing check: ' + failing)
@@ -327,8 +348,8 @@ class Runner:
             return
         # Recover PR number if creation succeeded but saving state did not.
         if item['pr'] is None:
-            item['pr'] = self.github.open(item['repo'], job['request'])
-        status, failing = self.github.checks(item['repo'], item['pr'])
+            item['pr'] = self.github.open(self.github_repo(item), job['request'])
+        status, failing = self.github.checks(self.github_repo(item), item['pr'])
         self.log(item, 'checks: ' + status)
         if status == 'red':
             self.attention(item, 'escalation', 'failing check: ' + failing)
@@ -358,29 +379,34 @@ class Runner:
             for item in self.data['slices']:
                 if item['state'] == 'accepted':
                     continue
-                job = self.jobs.get(item['id'])
-                if job:
-                    phase_before = job['phase']
-                    if (phase_before in ('merged', 'node-step')
-                            and not any(e['event'] == 'merged: ' + job['sha'] for e in item['log'])):
-                        self.log(item, 'merged: ' + job['sha'], True)
-                        item['attention'] = None
-                        if phase_before == 'node-step':
-                            self.attention(item, 'node-step', job['request']['node_steps'])
-                    marker = 'collected turn: ' + Path(job['run']).name
-                    if (job['phase'] in ('ended', 'collected', 'pr')
-                            and not any(e['event'] == marker for e in item['log'])):
-                        item['session'] = {'tool': job['tool'], 'id': job['session'], 'folder': job['repo']}
-                        item['state'] = 'issued'
-                        self.apply_final(item, job)
-                    else:
-                        self.collect(item, job)
-                    # PR checks begin on a later pass than the waiting reply.
-                    if phase_before == 'pr':
-                        self.pr_checks(item, job)
+                try:
+                    job = self.jobs.get(item['id'])
+                    if job:
+                        phase_before = job['phase']
+                        if (phase_before in ('merged', 'node-step')
+                                and not any(e['event'] == 'merged: ' + job['sha'] for e in item['log'])):
+                            self.log(item, 'merged: ' + job['sha'], True)
+                            item['attention'] = None
+                            if phase_before == 'node-step':
+                                self.attention(item, 'node-step', job['request']['node_steps'])
+                        marker = 'collected turn: ' + Path(job['run']).name
+                        if (job['phase'] in ('ended', 'collected', 'pr')
+                                and not any(e['event'] == marker for e in item['log'])):
+                            item['session'] = {'tool': job['tool'], 'id': job['session'], 'folder': job['repo']}
+                            item['state'] = 'issued'
+                            self.apply_final(item, job)
+                        else:
+                            self.collect(item, job)
+                        if phase_before == 'pr':
+                            self.pr_checks(item, job)
+                except Exception:
+                    self.slice_failure(item, 'collect/deliver')
             for item in self.data['slices']:
                 if item['state'] != 'accepted':
-                    self.deliver(item)
+                    try:
+                        self.deliver(item)
+                    except Exception:
+                        self.slice_failure(item, 'delivery')
             accepted = {s['id'] for s in self.data['slices'] if s['state'] == 'accepted'}
             for item in self.data['slices']:
                 if (item['state'] == 'ready' and not item['paused'] and item['slot']
@@ -402,8 +428,8 @@ class Runner:
                             if closing is not None:
                                 prompt = ''.join(lines[closing + 1:])
                         self.launch(item, prompt)
-                    except OSError as error:
-                        self.attention(item, 'escalation', str(error))
+                    except Exception:
+                        self.slice_failure(item, 'start')
             changed = json.dumps(self.data, ensure_ascii=False, separators=(',', ':')) != state_before
             if changed or self.notices:
                 state.save(self.path, self.data)

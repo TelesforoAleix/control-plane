@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import subprocess
 from unittest.mock import Mock
 
 import pytest
@@ -35,6 +36,7 @@ class FakeProcesses:
 
 class FakeGitHub:
     def __init__(self):
+        self.repository = Mock(return_value='example/repo')
         self.open = Mock(return_value=12)
         self.find_pr = Mock(return_value=None)
         self.checks = Mock(return_value=('pending', ''))
@@ -556,6 +558,86 @@ def test_codex_pr_lookup_uses_newest_matching_pr():
     assert gh.find_pr('owner/repo', 'feature') == 11
     gh.call.assert_called_once_with('owner/repo', 'pr', 'list', '--head', 'feature', '--state', 'all',
                                     '--json', 'number,createdAt')
+
+
+@pytest.mark.parametrize('remote,expected', [
+    ('https://github.com/TelesforoAleix/control-plane.git', 'TelesforoAleix/control-plane'),
+    ('git@github.com:TelesforoAleix/control-plane.git', 'TelesforoAleix/control-plane'),
+    ('ssh://git@github.com/TelesforoAleix/control-plane.git', 'TelesforoAleix/control-plane'),
+])
+def test_github_repository_parses_origin(tmp_path, remote, expected):
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    subprocess.run(['git', '-C', str(repo), 'init'], check=True, capture_output=True)
+    subprocess.run(['git', '-C', str(repo), 'remote', 'add', 'origin', remote], check=True)
+    assert GitHub().repository(repo) == expected
+
+
+def test_github_repository_missing_origin_is_state_error(tmp_path):
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    subprocess.run(['git', '-C', str(repo), 'init'], check=True, capture_output=True)
+    with pytest.raises(state.StateError, match='missing GitHub origin'):
+        GitHub().repository(repo)
+
+
+def test_gh_arguments_include_full_repository_for_pr_calls(monkeypatch):
+    calls = []
+    responses = iter([
+        '[{"number":12}]',  # lookup
+        '[]',  # open lookup
+        'https://github.com/owner/repo/pull/12',  # create
+        '{"statusCheckRollup":[]}',  # checks
+        '{"state":"OPEN","mergeCommit":null}',  # merge view
+        '',  # merge
+        '{"state":"MERGED","mergeCommit":{"oid":"abc"}}',  # merge confirmation
+    ])
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, next(responses), '')
+    monkeypatch.setattr('cplane.runner.subprocess.run', fake_run)
+    gh = GitHub()
+    request = {'branch': 'feat/x', 'title': 'Title', 'body': 'Body'}
+    assert gh.find_pr('owner/repo', 'feat/x') == 12
+    assert gh.open('owner/repo', request) == 12
+    assert gh.checks('owner/repo', 12) == ('green', '')
+    assert gh.merge('owner/repo', 12) == 'abc'
+    assert len(calls) == 7
+    assert all(call[-2:] == ['-R', 'owner/repo'] for call in calls)
+    assert calls[0][1:4] == ['pr', 'list', '--head']
+    assert calls[1][1:4] == ['pr', 'list', '--head']
+    assert calls[2][1:3] == ['pr', 'create']
+    assert calls[3][1:3] == ['pr', 'view']
+    assert calls[4][1:3] == ['pr', 'view']
+    assert calls[5][1:3] == ['pr', 'merge']
+    assert calls[6][1:3] == ['pr', 'view']
+
+
+def test_slice_collection_failure_does_not_stop_healthy_slice_start(setup):
+    r, p, _ = setup
+    data = state.load(r.path)
+    base = data['slices'][0]
+    broken = copy.deepcopy(base)
+    broken.update(id='example/broken', state='issued', repo='example/repo', session={'tool': 'codex', 'id': 's', 'folder': str(r.repos / 'repo')})
+    healthy = copy.deepcopy(base)
+    healthy.update(id='example/healthy', repo='example/healthy')
+    (r.repos / 'healthy').mkdir()
+    data['slices'] = [broken, healthy]
+    state.save(r.path, data)
+    run = r.runs / 'broken'
+    run.mkdir(parents=True)
+    job = {'id': broken['id'], 'repo': str(r.repos / 'repo'), 'run': str(run), 'tool': 'codex',
+           'model': 'gpt-sol', 'started_ns': 1, 'session': 's', 'phase': 'running'}
+    r.save_job(job)
+    p.results[str(run)] = (True, 's', {'kind': 'handover', 'body': 'done'}, '')
+    r.github.repository = Mock(side_effect=state.StateError('missing GitHub origin'))
+    r.run()
+    result = state.load(r.path)['slices']
+    assert result[0]['attention']['kind'] == 'escalation'
+    assert result[0]['attention']['body'].startswith('collect/deliver failed:')
+    assert 'missing GitHub origin' in result[0]['attention']['body']
+    assert [j['id'] for j in p.started] == ['example/healthy']
+    r.git.commit.assert_called_once()
 
 
 def test_missing_final_escalation_summarizes_tool_exit(setup, tmp_path):
