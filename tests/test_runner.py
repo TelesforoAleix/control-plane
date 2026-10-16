@@ -1,0 +1,677 @@
+import copy
+from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+import plistlib
+from unittest.mock import Mock
+
+import pytest
+
+from cplane import agent, state
+from cplane.cli import main
+from cplane.executors import CLAUDE_PARAGRAPH, Processes, command
+from cplane.runner import Runner, GitHub
+
+NOW = datetime(2026, 10, 16, 10, tzinfo=timezone.utc)
+
+
+class FakeProcesses:
+    def __init__(self):
+        self.started = []
+        self.results = {}
+
+    def start(self, job):
+        self.started.append(copy.deepcopy(job))
+        return len(self.started)
+
+    def poll(self, job):
+        return self.results.get(job['run'], (False, 'session-1', None, ''))
+
+    def finish(self, kind='handover', body='done', session='session-1'):
+        job = self.started[-1]
+        self.results[job['run']] = (True, session, {'kind': kind, 'body': body} if kind else None, 'line\n' * 40)
+
+
+class FakeGitHub:
+    def __init__(self):
+        self.open = Mock(return_value=12)
+        self.checks = Mock(return_value=('pending', ''))
+        self.merge = Mock(return_value='abc123')
+
+
+@pytest.fixture
+def setup(tmp_path, slice_data, make_state):
+    slice_data['slot'] = (NOW - timedelta(minutes=1)).isoformat()
+    path = make_state()
+    (tmp_path / 'briefs').mkdir()
+    (tmp_path / 'briefs/W1.md').write_text('The exact prompt.\n')
+    (tmp_path / 'repos/repo').mkdir(parents=True)
+    processes, github = FakeProcesses(), FakeGitHub()
+    runner = Runner(path, processes=processes, github=github, git=Mock(), clock=lambda: NOW,
+                    codex_reader=lambda: 10, claude_reader=lambda: None,
+                    runs=tmp_path / 'runs', repos=tmp_path / 'repos')
+    return runner, processes, github
+
+
+def item(runner):
+    return state.load(runner.path)['slices'][0]
+
+
+def edit(runner, change):
+    data = state.load(runner.path)
+    change(data['slices'][0])
+    state.save(runner.path, data)
+
+
+def test_pass_order_prompt_session_and_notices(setup):
+    r, p, _ = setup
+    r.run()
+    assert p.started[0]['prompt'] == 'The exact prompt.\n'
+    assert p.started[0]['tool'] == 'codex'
+    assert item(r)['state'] == 'issued'
+    r.run()
+    assert item(r)['session'] == {'tool': 'codex', 'id': 'session-1', 'folder': str(r.repos / 'repo')}
+    p.finish()
+    r.run()
+    assert item(r)['state'] == 'in review'
+    assert [n['event'] for n in map(json.loads, Path(str(r.path) + '.outbox.jsonl').read_text().splitlines())] == ['started', 'finished']
+    assert all(e['actor'] == 'runner' for e in item(r)['log'])
+    assert r.git.mock_calls[0][0] == 'pull'
+    assert r.git.mock_calls[-1][0] == 'commit'
+    assert len(p.started) == 1
+    r.run()
+    assert item(r)['state'] == 'in review'
+
+
+@pytest.mark.parametrize('field,value', [('state', 'planned'), ('paused', True), ('slot', None),
+    ('slot', (NOW + timedelta(seconds=1)).isoformat()), ('depends_on', ['missing/W1'])])
+def test_not_due(setup, field, value):
+    r, p, _ = setup
+    edit(r, lambda s: s.update({field: value}))
+    r.run()
+    assert not p.started
+
+
+def test_dependency_accepted(setup):
+    r, p, _ = setup
+    data = state.load(r.path)
+    dep = copy.deepcopy(data['slices'][0])
+    dep.update(id='example/W0', state='accepted')
+    data['slices'][0]['depends_on'] = [dep['id']]
+    data['slices'].append(dep)
+    state.save(r.path, data)
+    r.run()
+    assert len(p.started) == 1
+
+
+@pytest.mark.parametrize('used,age,claude_used,model,expected', [
+    (99.9, 0, 0, 'gpt-sol', 'codex'),
+    (100, 0, 89.9, 'gpt-sol', 'opus'),
+    (100, 0, 0, 'other', 'sonnet'),
+    (100, 3599, 0, 'gpt-sol', 'opus'),
+    (100, 3600, 0, 'gpt-sol', None),
+    (100, 0, 90, 'gpt-sol', None),
+    (None, 0, 1, 'gpt-sol', 'opus'),
+    (100, -1, 0, 'gpt-sol', None),
+])
+def test_capacity(setup, used, age, claude_used, model, expected):
+    r, p, _ = setup
+    edit(r, lambda s: s['executor'].update(model=model))
+    r.codex_reader = lambda: used
+    r.claude_reader = lambda: {'at': NOW.timestamp() - age, 'rate_limits': {'five_hour': {'used_percentage': claude_used}}}
+    r.run()
+    if expected:
+        assert len(p.started) == 1
+        assert p.started[0]['model'] == (model if expected == 'codex' else expected)
+        assert p.started[0]['prompt'] == 'The exact prompt.\n' + (CLAUDE_PARAGRAPH if expected != 'codex' else '')
+    else:
+        assert not p.started
+        assert item(r)['state'] == 'ready'
+
+
+def test_missing_capacity_defers(setup):
+    r, p, _ = setup
+    r.codex_reader = lambda: None
+    r.run()
+    assert not p.started
+
+
+@pytest.mark.parametrize('repos,count', [(['repo', 'repo', 'third'], 2), (['repo', 'second', 'third'], 2)])
+def test_running_limits(setup, repos, count):
+    r, p, _ = setup
+    data = state.load(r.path)
+    base = data['slices'][0]
+    data['slices'] = []
+    for i, repo in enumerate(repos):
+        (r.repos / repo).mkdir(exist_ok=True)
+        s = copy.deepcopy(base)
+        s.update(id=f'example/W{i}', repo='example/' + repo)
+        data['slices'].append(s)
+    state.save(r.path, data)
+    r.run()
+    assert len(p.started) == count
+    assert len({j['repo'] for j in p.started}) == count
+    r.run()
+    assert len(p.started) == count
+    p.results[p.started[0]['run']] = (True, 'session-1', {'kind': 'handover', 'body': 'done'}, '')
+    r.run()
+    assert len(p.started) == 3
+
+
+@pytest.mark.parametrize('kind,expected_state,attention', [
+    ('handover', 'in review', None), ('question', 'issued', 'question'),
+    ('escalation', 'escalated', 'escalation'), ('waiting', 'issued', 'node-step'),
+    (None, 'escalated', 'escalation'),
+])
+def test_collect(setup, kind, expected_state, attention):
+    r, p, _ = setup
+    r.run()
+    p.finish(kind, 'body')
+    r.run()
+    assert item(r)['state'] == expected_state
+    a = item(r)['attention']
+    assert (a['kind'] if a else None) == attention
+    if kind is None:
+        assert a['body'].startswith('the run ended without a final message')
+        assert a['body'].count('line') == 40
+    elif a:
+        assert a['body'] == 'body'
+
+
+@pytest.mark.parametrize('kind', ['question', 'escalation'])
+def test_answer_resumes_and_capacity_defers(setup, kind):
+    r, p, _ = setup
+    r.run()
+    p.finish(kind)
+    r.run()
+    edit(r, lambda s: s['attention'].update(answer='exact answer'))
+    r.codex_reader = lambda: 100
+    r.run()
+    assert len(p.started) == 1
+    assert item(r)['attention']['answer'] == 'exact answer'
+    r.codex_reader = lambda: 1
+    r.run()
+    assert len(p.started) == 2
+    assert p.started[-1]['prompt'] == 'exact answer'
+    assert p.started[-1]['resume'] == 'session-1'
+    assert item(r)['attention'] is None
+    p.finish()
+    r.run()
+    assert item(r)['state'] == 'in review'
+
+
+def claude_start(r):
+    r.codex_reader = lambda: 100
+    r.claude_reader = lambda: {'at': NOW.timestamp(), 'rate_limits': {'five_hour': {'used_percentage': 1}}}
+    r.run()
+
+
+def pr_reply(node_steps=None):
+    return '```json\n' + json.dumps({'branch': 'feat/example', 'title': 'Example', 'body': 'Change README', 'node_steps': node_steps}) + '\n```\nDetails'
+
+
+def test_claude_pr_red(setup):
+    r, p, gh = setup
+    claude_start(r)
+    p.finish('waiting', pr_reply())
+    r.run()
+    assert item(r)['pr'] == 12
+    gh.checks.return_value = 'red', 'test'
+    r.run()
+    assert item(r)['attention']['kind'] == 'escalation'
+    assert 'test' in item(r)['attention']['body']
+    gh.merge.assert_not_called()
+
+
+def test_claude_auto_merge_resume_handover(setup):
+    r, p, gh = setup
+    edit(r, lambda s: s.update(stop_before_merge=False))
+    claude_start(r)
+    p.finish('waiting', pr_reply())
+    r.run()
+    gh.checks.return_value = 'green', ''
+    r.run()
+    gh.merge.assert_called_once_with('example/repo', 12)
+    assert p.started[-1]['prompt'] == 'merged as abc123'
+    assert p.started[-1]['resume'] == 'session-1'
+    assert p.started[-1]['tool'] == 'claude'
+    p.finish()
+    r.run()
+    assert item(r)['state'] == 'in review'
+
+
+@pytest.mark.parametrize('node_steps', [None, 'Run migration on owner node'])
+def test_claude_approval_and_node_steps(setup, node_steps):
+    r, p, gh = setup
+    claude_start(r)
+    p.finish('waiting', pr_reply(node_steps))
+    r.run()
+    gh.checks.return_value = 'green', ''
+    r.run()
+    assert item(r)['attention']['kind'] == 'merge'
+    gh.merge.assert_not_called()
+    edit(r, lambda s: s['attention'].update(approved=True))
+    r.run()
+    gh.merge.assert_called_once()
+    if node_steps:
+        assert len(p.started) == 1
+        assert item(r)['attention']['kind'] == 'node-step'
+        assert item(r)['attention']['body'] == node_steps
+    else:
+        assert len(p.started) == 2
+        assert item(r)['attention'] is None
+
+
+def test_claude_resume_waits_for_capacity_after_merge(setup):
+    r, p, gh = setup
+    edit(r, lambda s: s.update(stop_before_merge=False))
+    claude_start(r)
+    p.finish('waiting', pr_reply())
+    r.run()
+    gh.checks.return_value = 'green', ''
+    r.claude_reader = lambda: None
+    r.run()
+    gh.merge.assert_called_once()
+    assert len(p.started) == 1
+    r.claude_reader = lambda: {'at': NOW.timestamp(), 'rate_limits': {'five_hour': {'used_percentage': 1}}}
+    r.run()
+    assert len(p.started) == 2
+
+
+@pytest.mark.parametrize('body', [ '```json\n{}\n```', '```json\nnot json\n```'])
+def test_claude_invalid_pr(setup, body):
+    r, p, gh = setup
+    claude_start(r)
+    p.finish('waiting', body)
+    r.run()
+    assert item(r)['attention']['kind'] == 'escalation'
+    gh.open.assert_not_called()
+
+
+def test_codex_merge_approval(setup):
+    r, p, gh = setup
+    r.run()
+    p.finish('question')
+    r.run()
+    edit(r, lambda s: s['attention'].update(kind='merge', approved=True))
+    r.run()
+    assert p.started[-1]['prompt'] == 'The owner approves the merge.'
+    gh.merge.assert_not_called()
+
+
+def test_resume_obeys_repository_limit(setup):
+    r, p, _ = setup
+    r.run()
+    p.finish('question')
+    r.run()
+    data = state.load(r.path)
+    second = copy.deepcopy(data['slices'][0])
+    second.update(id='example/W2', state='ready', session=None, attention=None)
+    data['slices'].append(second)
+    state.save(r.path, data)
+    r.run()
+    edit(r, lambda s: s['attention'].update(answer='answer'))
+    r.run()
+    assert len(p.started) == 2
+    assert item(r)['attention']['answer'] == 'answer'
+
+
+def test_launch_failure_collected(setup):
+    r, p, _ = setup
+    p.start = Mock(side_effect=OSError('missing executable'))
+    r.run()
+    job = r.jobs[item(r)['id']]
+    p.results[job['run']] = True, '', None, 'missing executable'
+    r.run()
+    assert item(r)['state'] == 'escalated'
+
+
+def test_pull_failure_never_launches(setup):
+    r, p, _ = setup
+    r.git.pull.side_effect = state.StateError('pull failed')
+    with pytest.raises(state.StateError, match='pull failed'):
+        r.run()
+    assert not p.started
+
+
+def test_runner_cli_uses_default_commit(make_state, monkeypatch):
+    path = make_state()
+    fake = Mock()
+    monkeypatch.setattr('cplane.runner.Runner', fake)
+    assert main(['run', '--state', str(path)]) == 0
+    fake.assert_called_once_with(path)
+    fake.return_value.run.assert_called_once()
+
+
+def test_plist():
+    data = plistlib.loads(plistlib.dumps(agent.render('/tmp/state.json', home='/tmp/owner', python='/python', environment={})))
+    assert data['AbandonProcessGroup'] is True
+    assert data['StartInterval'] == 300
+    assert data['StandardOutPath'] == '/tmp/owner/Library/Logs/cplane/runner.log'
+    assert data['StandardErrorPath'] == '/tmp/owner/Library/Logs/cplane/runner-error.log'
+    assert data['ProgramArguments'] == ['/python', '-m', 'cplane.cli', '--state', '/tmp/state.json', 'run']
+
+
+def test_agent_install_uninstall_only_fake_launchctl(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent.Path, 'home', lambda: tmp_path)
+    call = Mock()
+    monkeypatch.setattr(agent, 'launchctl', call)
+    agent.install(tmp_path / 'state.json')
+    plist = tmp_path / 'Library/LaunchAgents/com.cplane.runner.plist'
+    assert plist.exists()
+    assert call.call_args.args[0] == 'bootstrap'
+    agent.uninstall()
+    assert not plist.exists()
+    assert call.call_args.args[0] == 'bootout'
+
+
+@pytest.mark.parametrize('tool', ['codex', 'claude'])
+def test_executor_arguments(tool, tmp_path):
+    job = {'tool': tool, 'run': str(tmp_path), 'repo': '/tmp/repo', 'model': 'model', 'prompt': 'literal $(touch nope)', 'resume': 'session'}
+    args = command(job)
+    assert args[-1] == job['prompt']
+    assert 'session' in args
+    if tool == 'codex':
+        assert 'sandbox_mode="workspace-write"' in args
+        assert 'sandbox_workspace_write.network_access=true' in args
+        assert 'sandbox_workspace_write.writable_roots=["/tmp/repo/.git"]' in args
+    else:
+        assert args[args.index('--allowedTools') + 1] == 'Bash'
+        assert args[args.index('--permission-mode') + 1] == 'acceptEdits'
+
+
+@pytest.mark.parametrize('tool', ['codex', 'claude'])
+@pytest.mark.parametrize('fresh', [True, False])
+def test_process_final_freshness(tmp_path, tool, fresh):
+    import os
+    start = 1_700_000_000_000_000_000
+    job = {'tool': tool, 'run': str(tmp_path), 'started_ns': start, 'session': ''}
+    final = {'kind': 'handover', 'body': 'done'}
+    if tool == 'codex':
+        last = tmp_path / 'last.json'
+        last.write_text(json.dumps(final))
+        (tmp_path / 'turn.jsonl').write_text('{"type":"thread.started","thread_id":"session"}\n')
+    else:
+        last = tmp_path / 'claude.json'
+        last.write_text(json.dumps({'structured_output': final, 'session_id': 'session'}))
+    os.utime(last, ns=(start + (1 if fresh else -1),) * 2)
+    (tmp_path / 'exit.json').write_text('{}')
+    done, session, result, _ = Processes().poll(job)
+    assert done
+    assert result == (final if fresh else None)
+    if fresh:
+        assert session == 'session'
+
+
+@pytest.mark.parametrize('checks,expected', [
+    ([{'name': 'test', 'conclusion': 'FAILURE'}], ('red', 'test')),
+    ([{'context': 'external', 'state': 'ERROR'}], ('red', 'external')),
+    ([{'name': 'test', 'conclusion': ''}], ('pending', '')),
+    ([{'name': 'test', 'conclusion': 'SUCCESS'}], ('green', '')),
+    ([], ('green', '')),
+])
+def test_github_check_states(checks, expected):
+    gh = GitHub()
+    gh.call = Mock(return_value=json.dumps({'statusCheckRollup': checks, 'mergeStateStatus': 'CLEAN'}))
+    assert gh.checks('owner/repo', 1) == expected
+
+
+def test_claude_plain_waiting_is_node_step(setup):
+    r, p, gh = setup
+    claude_start(r)
+    p.finish('waiting', 'A long job is running; inspect its log after it ends.')
+    r.run()
+    assert item(r)['attention']['kind'] == 'node-step'
+    gh.open.assert_not_called()
+
+
+def test_checks_only_on_later_pass(setup):
+    r, p, gh = setup
+    claude_start(r)
+    p.finish('waiting', pr_reply())
+    r.run()
+    gh.checks.assert_not_called()
+    r.run()
+    gh.checks.assert_called_once()
+
+
+def test_approval_does_not_merge_newly_red_check(setup):
+    r, p, gh = setup
+    claude_start(r)
+    p.finish('waiting', pr_reply())
+    r.run()
+    gh.checks.return_value = 'green', ''
+    r.run()
+    edit(r, lambda s: s['attention'].update(approved=True))
+    gh.checks.return_value = 'red', 'test'
+    r.run()
+    gh.merge.assert_not_called()
+    assert item(r)['attention']['kind'] == 'escalation'
+
+
+def test_replays_collection_if_state_save_fails(setup, monkeypatch):
+    r, p, _ = setup
+    r.run()
+    p.finish('question', 'Please answer')
+    save = state.save
+    monkeypatch.setattr(state, 'save', Mock(side_effect=OSError('disk unavailable')))
+    with pytest.raises(OSError):
+        r.run()
+    monkeypatch.setattr(state, 'save', save)
+    r.run()
+    assert item(r)['attention']['body'] == 'Please answer'
+    assert len(p.started) == 1
+
+
+def test_missing_local_metadata_occupies_slot(setup):
+    r, p, _ = setup
+    data = state.load(r.path)
+    lost = copy.deepcopy(data['slices'][0])
+    lost.update(id='example/W0', state='issued', session={'tool': 'codex', 'id': 'lost', 'folder': '/tmp/repo'})
+    data['slices'].append(lost)
+    state.save(r.path, data)
+    r.run()
+    assert not p.started
+
+
+def test_codex_usage_latest_nonnull_report(tmp_path, monkeypatch):
+    from cplane.runner import codex_usage
+    folder = tmp_path / '.codex/sessions'
+    folder.mkdir(parents=True)
+    (folder / 'new.jsonl').write_text('\n'.join([
+        '{"payload":{"rate_limits":{"primary":{"used_percent":34}}}}',
+        '{"payload":{"rate_limits":null}}', 'not json']))
+    assert codex_usage(folder) == 34
+
+
+def test_usage_unavailable_or_malformed(tmp_path, monkeypatch):
+    from cplane.runner import codex_usage, claude_usage
+    assert codex_usage(tmp_path / '.codex/sessions') is None
+    assert claude_usage(tmp_path / '.claude/usage-now.json') is None
+    (tmp_path / '.claude').mkdir()
+    (tmp_path / '.claude/usage-now.json').write_text('invalid')
+    assert claude_usage(tmp_path / '.claude/usage-now.json') is None
+
+
+def test_runner_real_git_pull_save_push(tmp_path, slice_data, monkeypatch):
+    import subprocess
+    monkeypatch.setenv('GIT_CONFIG_GLOBAL', '/dev/null')
+    monkeypatch.setenv('GIT_CONFIG_NOSYSTEM', '1')
+    for role in ('AUTHOR', 'COMMITTER'):
+        monkeypatch.setenv(f'GIT_{role}_NAME', 'Fixture')
+        monkeypatch.setenv(f'GIT_{role}_EMAIL', 'fixture@example.invalid')
+    def git(*args):
+        return subprocess.run(['git', *map(str, args)], capture_output=True, text=True, check=True).stdout.strip()
+    remote, local = tmp_path / 'state.git', tmp_path / 'state'
+    git('init', '--bare', '--initial-branch=main', remote)
+    git('clone', remote, local)
+    path = local / 'state.json'
+    path.write_text(json.dumps({'version': 1, 'slices': [slice_data]}))
+    (local / '.gitignore').write_text('*.lock\n')
+    git('-C', local, 'add', '.')
+    git('-C', local, 'commit', '-m', 'fixture')
+    git('-C', local, 'push', '-u', 'origin', 'main')
+    r = Runner(path, processes=FakeProcesses(), clock=lambda: NOW, runs=tmp_path / 'runs')
+    r.run()
+    assert git('-C', remote, 'rev-parse', 'main') == git('-C', local, 'rev-parse', 'HEAD')
+    assert json.loads(git('-C', remote, 'show', 'main:state.json'))['slices'][0]['log'][-1]['actor'] == 'runner'
+
+
+def test_detached_starter_closes_stdin_and_writes_config(tmp_path, monkeypatch):
+    from cplane.executors import FINAL_SCHEMA, CLAUDE_SETTINGS
+    popen = Mock(return_value=Mock(pid=123))
+    monkeypatch.setattr('cplane.executors.subprocess.Popen', popen)
+    job = {'tool': 'codex', 'run': str(tmp_path), 'repo': '/tmp/repo', 'model': 'm', 'prompt': 'brief'}
+    assert Processes().start(job) == 123
+    kwargs = popen.call_args.kwargs
+    import subprocess
+    assert kwargs['stdin'] == subprocess.DEVNULL
+    assert kwargs['start_new_session'] is True
+    assert kwargs['close_fds'] is True
+    assert json.loads((tmp_path / 'schema.json').read_text()) == FINAL_SCHEMA
+    assert json.loads((tmp_path / 'sandbox.json').read_text()) == CLAUDE_SETTINGS
+    assert (tmp_path / 'request.json').stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize('reply', ['{', '{"kind":"unknown","body":"x"}', '{"kind":"handover","body":1}'])
+def test_invalid_final_escalates_not_handover(tmp_path, reply):
+    import time
+    job = {'tool': 'codex', 'run': str(tmp_path), 'started_ns': time.time_ns() - 1_000_000_000}
+    (tmp_path / 'last.json').write_text(reply)
+    (tmp_path / 'exit.json').write_text('{}')
+    done, _, final, _ = Processes().poll(job)
+    assert done and final is None
+
+
+def test_killed_supervisor_and_log_tail(tmp_path, monkeypatch):
+    monkeypatch.setattr('cplane.executors.os.killpg', Mock(side_effect=ProcessLookupError))
+    (tmp_path / 'turn.jsonl').write_text('\n'.join(str(i) for i in range(80)))
+    job = {'tool': 'codex', 'run': str(tmp_path), 'started_ns': 0, 'pid': 123}
+    done, _, final, tail = Processes().poll(job)
+    assert done and final is None
+    assert tail.splitlines() == [str(i) for i in range(40, 80)]
+
+
+def test_uninstall_cli_without_state(monkeypatch):
+    uninstall = Mock()
+    monkeypatch.setattr(agent, 'uninstall', uninstall)
+    monkeypatch.delenv('CPLANE_STATE', raising=False)
+    assert main(['uninstall-agent']) == 0
+    uninstall.assert_called_once()
+
+
+def test_fallback_keeps_configured_model_for_future_starts(setup):
+    r, p, _ = setup
+    original = item(r)['executor']
+    claude_start(r)
+    assert item(r)['executor'] == original
+    assert item(r)['session']['tool'] == 'claude'
+
+
+def test_claude_session_resumes_even_when_codex_capacity_returns(setup):
+    r, p, _ = setup
+    claude_start(r)
+    p.finish('question')
+    r.run()
+    edit(r, lambda s: s['attention'].update(answer='answer'))
+    r.codex_reader = lambda: 0
+    r.run()
+    assert p.started[-1]['tool'] == 'claude'
+    assert p.started[-1]['prompt'] == 'answer'
+
+
+def test_node_step_recovery_after_state_save_failure(setup, monkeypatch):
+    r, p, gh = setup
+    edit(r, lambda s: s.update(stop_before_merge=False))
+    claude_start(r)
+    p.finish('waiting', pr_reply('Owner node work'))
+    r.run()
+    gh.checks.return_value = 'green', ''
+    save = state.save
+    monkeypatch.setattr(state, 'save', Mock(side_effect=OSError('disk unavailable')))
+    with pytest.raises(OSError):
+        r.run()
+    monkeypatch.setattr(state, 'save', save)
+    r.run()
+    assert item(r)['attention']['kind'] == 'node-step'
+    assert item(r)['attention']['body'] == 'Owner node work'
+    assert len(p.started) == 1
+
+
+def test_resume_cannot_exceed_two_running_turns(setup):
+    r, p, _ = setup
+    r.run()
+    p.finish('question')
+    r.run()
+    data = state.load(r.path)
+    base = data['slices'][0]
+    for i in range(2):
+        repo = f'other{i}'
+        (r.repos / repo).mkdir()
+        s = copy.deepcopy(base)
+        s.update(id=f'example/other{i}', repo=f'example/{repo}', state='ready', attention=None, session=None)
+        data['slices'].append(s)
+    state.save(r.path, data)
+    r.run()
+    assert len(p.started) == 3  # one finished question, two running
+    edit(r, lambda s: s['attention'].update(answer='answer'))
+    r.run()
+    assert len(p.started) == 3
+    assert item(r)['attention']['answer'] == 'answer'
+
+
+def test_github_open_and_merge_are_recoverable():
+    gh = GitHub()
+    gh.call = Mock(return_value='[{"number":12}]')
+    request = {'branch': 'feat/example', 'title': 'title', 'body': 'body'}
+    assert gh.open('owner/repo', request) == 12
+    assert gh.call.call_count == 1
+    gh.call = Mock(side_effect=['[]', 'https://github.com/owner/repo/pull/12'])
+    assert gh.open('owner/repo', request) == 12
+    gh.call = Mock(return_value='{"state":"MERGED","mergeCommit":{"oid":"sha"}}')
+    assert gh.merge('owner/repo', 12) == 'sha'
+    assert gh.call.call_count == 1
+    gh.call = Mock(side_effect=['{"state":"OPEN","mergeCommit":null}', '', '{"state":"MERGED","mergeCommit":{"oid":"sha"}}'])
+    assert gh.merge('owner/repo', 12) == 'sha'
+    assert gh.call.call_count == 3
+
+
+def test_live_process_group_reserves_capacity_after_supervisor_dies(tmp_path, monkeypatch):
+    monkeypatch.setattr('cplane.executors.os.killpg', Mock())
+    job = {'tool': 'codex', 'run': str(tmp_path), 'started_ns': 0, 'pid': 123}
+    assert Processes().poll(job)[0] is False
+
+
+def test_supervisor_writes_exit_marker_and_closes_executor_stdin(tmp_path, monkeypatch):
+    from cplane.executors import supervise
+    import subprocess
+    job = {'tool': 'codex', 'run': str(tmp_path), 'repo': str(tmp_path), 'model': 'model', 'prompt': 'prompt'}
+    (tmp_path / 'request.json').write_text(json.dumps(job))
+    run = Mock(return_value=subprocess.CompletedProcess([], 7))
+    monkeypatch.setattr('cplane.executors.subprocess.run', run)
+    supervise(tmp_path)
+    assert run.call_args.kwargs['stdin'] == subprocess.DEVNULL
+    assert run.call_args.kwargs['cwd'] == str(tmp_path)
+    assert json.loads((tmp_path / 'exit.json').read_text())['code'] == 7
+
+
+def test_approved_merge_with_pending_checks_waits(setup):
+    r, p, gh = setup
+    claude_start(r)
+    p.finish('waiting', pr_reply())
+    r.run()
+    gh.checks.return_value = 'green', ''
+    r.run()
+    edit(r, lambda s: s['attention'].update(approved=True))
+    gh.checks.return_value = 'pending', ''
+    r.run()
+    gh.merge.assert_not_called()
+    assert item(r)['attention']['approved']
+
+
+def test_prompt_preserves_crlf_and_trailing_whitespace(setup):
+    r, p, _ = setup
+    raw = b'Exact prompt\r\nwith whitespace  \r\n'
+    (r.path.parent / 'briefs/W1.md').write_bytes(raw)
+    r.run()
+    assert p.started[0]['prompt'].encode('utf-8') == raw
