@@ -492,10 +492,30 @@ def test_executor_arguments(tool, resume, tmp_path):
     if tool == 'codex':
         assert 'sandbox_mode="workspace-write"' in args
         assert 'sandbox_workspace_write.network_access=true' in args
-        assert 'sandbox_workspace_write.writable_roots=["/tmp/repo/.git"]' in args
+        from cplane.executors import cache_roots
+        expected_roots = ['/tmp/repo/.git', *cache_roots()]
+        assert args[args.index('-c', args.index('sandbox_workspace_write.network_access=true') + 1) + 1] == (
+            'sandbox_workspace_write.writable_roots=' + json.dumps(expected_roots))
     else:
         assert args[args.index('--allowedTools') + 1] == 'Bash'
         assert args[args.index('--permission-mode') + 1] == 'acceptEdits'
+
+
+def test_codex_exact_arguments_and_missing_cache_skipped(tmp_path, monkeypatch):
+    from cplane import executors
+    home = tmp_path / 'home'
+    (home / '.cache/uv').mkdir(parents=True)
+    monkeypatch.setattr(executors.Path, 'home', classmethod(lambda cls: home))
+    run = tmp_path / 'run'
+    job = {'tool': 'codex', 'run': str(run), 'repo': '/tmp/repo', 'model': 'model',
+           'prompt': '-literal prompt', 'resume': 'session'}
+    assert command(job) == [
+        'codex', 'exec', '-m', 'model', '-c', 'sandbox_mode="workspace-write"',
+        '-c', 'sandbox_workspace_write.network_access=true', '-c',
+        'sandbox_workspace_write.writable_roots=' + json.dumps(
+            ['/tmp/repo/.git', str((home / '.cache/uv').resolve())]),
+        '--output-schema', str(run / 'schema.json'), '--json', '-o', str(run / 'last.json'),
+        'resume', 'session', '--', '-literal prompt']
 
 
 @pytest.mark.parametrize('tool', ['codex', 'claude'])
@@ -821,7 +841,7 @@ def test_runner_real_git_pull_does_not_commit_unchanged_state(tmp_path, slice_da
 
 
 def test_detached_starter_closes_stdin_and_writes_config(tmp_path, monkeypatch):
-    from cplane.executors import FINAL_SCHEMA, CLAUDE_SETTINGS
+    from cplane.executors import FINAL_SCHEMA, claude_settings
     popen = Mock(return_value=Mock(pid=123))
     monkeypatch.setattr('cplane.executors.subprocess.Popen', popen)
     job = {'tool': 'codex', 'run': str(tmp_path), 'repo': '/tmp/repo', 'model': 'm', 'prompt': 'brief'}
@@ -832,7 +852,7 @@ def test_detached_starter_closes_stdin_and_writes_config(tmp_path, monkeypatch):
     assert kwargs['start_new_session'] is True
     assert kwargs['close_fds'] is True
     assert json.loads((tmp_path / 'schema.json').read_text()) == FINAL_SCHEMA
-    assert json.loads((tmp_path / 'sandbox.json').read_text()) == CLAUDE_SETTINGS
+    assert json.loads((tmp_path / 'sandbox.json').read_text()) == claude_settings()
     assert (tmp_path / 'request.json').stat().st_mode & 0o777 == 0o600
 
 
