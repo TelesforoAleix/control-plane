@@ -296,6 +296,8 @@ class Runner:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.git.pull(self.path)
             self.data = state.load(self.path)
+            if not self.data["slices"]:
+                return  # Nothing to mutate or commit in an empty scheduler.
             self.instant = self.clock()
             self.at = self.instant.isoformat()
             self.notices = []

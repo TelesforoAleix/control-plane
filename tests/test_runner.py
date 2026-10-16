@@ -675,3 +675,12 @@ def test_prompt_preserves_crlf_and_trailing_whitespace(setup):
     (r.path.parent / 'briefs/W1.md').write_bytes(raw)
     r.run()
     assert p.started[0]['prompt'].encode('utf-8') == raw
+
+
+def test_empty_state_is_successful_without_an_empty_git_commit(setup):
+    r, p, _ = setup
+    r.path.write_text('{"version":1,"slices":[]}\n')
+    r.run()
+    r.git.pull.assert_called_once_with(r.path)
+    r.git.commit.assert_not_called()
+    assert not p.started
