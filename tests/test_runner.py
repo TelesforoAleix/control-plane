@@ -82,12 +82,25 @@ def test_pass_order_prompt_session_and_notices(setup):
     assert [n['event'] for n in map(json.loads, Path(str(r.path) + '.outbox.jsonl').read_text().splitlines())] == ['started', 'finished']
     assert all(e['actor'] == 'runner' for e in item(r)['log'])
     assert r.git.mock_calls[0][0] == 'pull'
-    assert r.git.mock_calls[-1][0] == 'commit'
+    assert 'commit' in [call[0] for call in r.git.mock_calls]
+    assert r.git.mock_calls[-1][0] == 'tidy'
     assert r.git.commit.call_count == 3
     assert len(p.started) == 1
     assert r.github.find_pr.call_count == 1
     r.run()
     assert item(r)['state'] == 'in review'
+
+
+def test_tidy_skips_busy_repository_and_failure_does_not_fail_pass(setup, capsys):
+    r, _, _ = setup
+    r.run()
+    r.git.tidy.assert_not_called()
+    for job_file in r.runs.glob('*/job.json'):
+        job_file.unlink()
+    edit(r, lambda s: s.update(state='planned', slot=None, session={'tool': 'codex', 'id': '', 'folder': ''}))
+    r.git.tidy.side_effect = OSError('simulated git failure')
+    r.run()
+    assert 'repo: tidy failed: simulated git failure' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize('field,value', [('state', 'planned'), ('paused', True), ('slot', None),

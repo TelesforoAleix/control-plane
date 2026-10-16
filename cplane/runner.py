@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import time
 import traceback
 import uuid
@@ -14,6 +15,9 @@ import uuid
 from . import state
 from .executors import Processes, atomic_json, CLAUDE_PARAGRAPH
 from .times import now
+
+CODEX_WORKTREES = Path.home() / '.codex/worktrees'
+WORKTREE_MAX_AGE = 7 * 24 * 60 * 60
 
 
 def codex_usage(folder=None):
@@ -42,6 +46,44 @@ def claude_usage(path=None):
 
 
 class Git:
+    def tidy(self, path, *, now=None):
+        path = Path(path)
+        name = path.name
+        def call(*args):
+            result = subprocess.run(['git', '-C', str(path), *args], capture_output=True, text=True)
+            if result.returncode:
+                print(f'{name}: git {" ".join(args)} failed: {(result.stderr or result.stdout).strip()}', file=sys.stderr)
+            return result
+
+        head = call('symbolic-ref', '-q', 'HEAD')
+        if head.returncode == 1:
+            status = call('status', '--porcelain')
+            if status.returncode == 0 and not status.stdout:
+                default = call('symbolic-ref', '--short', 'refs/remotes/origin/HEAD')
+                branch = default.stdout.strip().removeprefix('origin/') if default.returncode == 0 else 'main'
+                if branch:
+                    call('switch', branch)
+
+        listed = call('worktree', 'list', '--porcelain')
+        if listed.returncode:
+            return
+        root = CODEX_WORKTREES.resolve()
+        timestamp = time.time() if now is None else now.timestamp()
+        for block in listed.stdout.strip().split('\n\n'):
+            first = next((line[9:] for line in block.splitlines() if line.startswith('worktree ')), None)
+            if not first:
+                continue
+            worktree = Path(first)
+            try:
+                resolved = worktree.resolve()
+                resolved.relative_to(root)
+                if timestamp - worktree.stat().st_mtime <= WORKTREE_MAX_AGE:
+                    continue
+            except (OSError, ValueError):
+                continue
+            call('worktree', 'remove', str(worktree))
+        call('worktree', 'prune')
+
     def pull(self, path):
         probe = subprocess.run(['git', '-C', str(path.parent), 'rev-parse', '--show-toplevel'],
                                capture_output=True, text=True)
@@ -442,3 +484,17 @@ class Runner:
                     os.fsync(stream.fileno())
             if changed or self.notices:
                 self.git.commit(self.path)
+            busy = set()
+            for item in self.data['slices']:
+                job = self.jobs.get(item['id'])
+                is_busy = (bool(job and job['phase'] == 'running')
+                           or item['state'] in ('issued', 'escalated')
+                           or bool(item['attention'] and item['attention'].get('answer') is None))
+                if is_busy:
+                    busy.add(self.repo(item))
+            for folder in sorted({self.repo(item) for item in self.data['slices']}):
+                if folder not in busy:
+                    try:
+                        self.git.tidy(folder, now=self.instant)
+                    except Exception as error:
+                        print(f'{folder.name}: tidy failed: {error}', file=sys.stderr)

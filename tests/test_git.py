@@ -1,4 +1,6 @@
+from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -6,10 +8,70 @@ import pytest
 
 from cplane import state
 from cplane.cli import change_for, main
+from cplane.runner import WORKTREE_MAX_AGE, Git
 
 
 def git(path, *args):
     return subprocess.run(["git", "-C", str(path), *args], check=True, text=True, capture_output=True).stdout.strip()
+
+
+@pytest.fixture
+def tidy_repo(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Fixture")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Fixture")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "--initial-branch=main", str(remote)], check=True, capture_output=True)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "clone", str(remote), str(repo)], check=True, capture_output=True)
+    (repo / "tracked").write_text("fixture\n")
+    git(repo, "add", "tracked")
+    git(repo, "commit", "-m", "fixture")
+    git(repo, "push", "-u", "origin", "main")
+    git(repo, "remote", "set-head", "origin", "main")
+    return repo
+
+
+def test_tidy_restores_only_clean_detached_clone(tidy_repo):
+    git(tidy_repo, "checkout", "--detach")
+    Git().tidy(tidy_repo)
+    assert git(tidy_repo, "branch", "--show-current") == "main"
+    git(tidy_repo, "checkout", "--detach")
+    (tidy_repo / "untracked").write_text("keep\n")
+    Git().tidy(tidy_repo)
+    assert git(tidy_repo, "branch", "--show-current") == ""
+    (tidy_repo / "untracked").unlink()
+    git(tidy_repo, "switch", "-c", "named")
+    Git().tidy(tidy_repo)
+    assert git(tidy_repo, "branch", "--show-current") == "named"
+
+
+def test_tidy_removes_only_old_codex_worktrees(tidy_repo, tmp_path, monkeypatch, capsys):
+    root = tmp_path / "codex" / "worktrees"
+    monkeypatch.setattr("cplane.runner.CODEX_WORKTREES", root)
+    root.mkdir(parents=True)
+    old = root / "old" / "repo"
+    new = root / "new" / "repo"
+    outside = tmp_path / "outside"
+    for folder in (old, new, outside):
+        folder.parent.mkdir(parents=True, exist_ok=True)
+        git(tidy_repo, "worktree", "add", "--detach", str(folder), "main")
+    now = datetime.fromtimestamp(1_800_000_000 + 60 * 24 * 60 * 60, timezone.utc)
+    old_time = now.timestamp() - WORKTREE_MAX_AGE - 10
+    os.utime(old, (old_time, old_time))
+    os.utime(new, (now.timestamp(), now.timestamp()))
+    dirty = root / "dirty" / "repo"
+    dirty.parent.mkdir(parents=True)
+    git(tidy_repo, "worktree", "add", "--detach", str(dirty), "main")
+    os.utime(dirty, (old_time, old_time))
+    (dirty / "untracked").write_text("keep")
+    Git().tidy(tidy_repo, now=now)
+    assert not old.exists(), capsys.readouterr().err
+    assert new.exists() and dirty.exists() and outside.exists()
+    assert "worktree remove" in capsys.readouterr().err
 
 
 @pytest.fixture
