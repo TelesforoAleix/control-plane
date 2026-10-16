@@ -164,6 +164,64 @@ def test_running_limits(setup, repos, count):
     assert len(p.started) == 3
 
 
+def test_paused_issued_slice_does_not_block(setup):
+    r, p, _ = setup
+    data = state.load(r.path)
+    parked = copy.deepcopy(data['slices'][0])
+    parked.update(id='example/parked', state='issued', paused=True)
+    data['slices'].append(parked)
+    state.save(r.path, data)
+
+    r.run()
+
+    assert len(p.started) == 1
+    assert item(r)['state'] == 'issued'
+
+
+def test_paused_running_job_does_not_count_or_make_repository_busy(setup):
+    r, _, _ = setup
+    r.data = state.load(r.path)
+    parked = copy.deepcopy(r.data['slices'][0])
+    parked.update(id='example/parked', state='issued', paused=True)
+    r.data['slices'].append(parked)
+    r.jobs = {
+        parked['id']: {
+            'id': parked['id'], 'repo': str(r.repos / 'repo'), 'phase': 'running'
+        }
+    }
+
+    assert r.room(r.data['slices'][0]) is None
+
+
+def test_deferrals_name_blocker_and_log_identical_reason_once(setup):
+    r, _, _ = setup
+    r.data = state.load(r.path)
+    candidate = r.data['slices'][0]
+    r.at = NOW.isoformat()
+    r.jobs = {
+        f'example/W{i}': {
+            'id': f'example/W{i}', 'repo': str(r.repos / f'repo{i}'), 'phase': 'running'
+        }
+        for i in range(2)
+    }
+
+    assert r.room(candidate) == 'deferred: executor limit (running: example/W0, example/W1)'
+    r.launch(candidate, 'prompt')
+    r.launch(candidate, 'prompt')
+    assert [entry['event'] for entry in candidate['log']] == [
+        'deferred: executor limit (running: example/W0, example/W1)'
+    ]
+
+    r.jobs = {
+        'example/W0': {
+            'id': 'example/W0', 'repo': str(r.repos / 'repo'), 'phase': 'running'
+        }
+    }
+    assert r.room(candidate) == 'deferred: repository busy (example/W0)'
+    r.launch(candidate, 'prompt')
+    assert candidate['log'][-1]['event'] == 'deferred: repository busy (example/W0)'
+
+
 @pytest.mark.parametrize('kind,expected_state,attention', [
     ('handover', 'in review', None), ('question', 'issued', 'question'),
     ('escalation', 'escalated', 'escalation'), ('waiting', 'issued', 'node-step'),

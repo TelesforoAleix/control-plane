@@ -135,13 +135,21 @@ class Runner:
         return None
 
     def room(self, item):
-        active = [j for j in self.jobs.values() if j['phase'] == 'running']
+        paused = {s['id'] for s in self.data['slices'] if s['paused']}
+        active = [j for j in self.jobs.values()
+                  if j['phase'] == 'running' and j['id'] not in paused]
         # An issued session whose local run files are missing still occupies a slot.
         unknown = [s for s in self.data['slices'] if s['id'] not in self.jobs
-                   and s['state'] in ('issued', 'awaiting handover') and not s['attention']]
-        return len(active) + len(unknown) < 2 and not any(
-            j['repo'] == str(self.repo(item)) for j in active
-        ) and not any(self.repo(s) == self.repo(item) for s in unknown)
+                   and s['state'] in ('issued', 'awaiting handover') and not s['attention']
+                   and not s['paused']]
+        running = sorted([j['id'] for j in active] + [s['id'] for s in unknown])
+        if len(running) >= 2:
+            return f"deferred: executor limit (running: {', '.join(running)})"
+        repo = self.repo(item)
+        busy = next((j['id'] for j in active if j['repo'] == str(repo)), None)
+        if busy is None:
+            busy = next((s['id'] for s in unknown if self.repo(s) == repo), None)
+        return f'deferred: repository busy ({busy})' if busy else None
 
     def repo(self, item):
         name = item['repo'].split('/')[-1]
@@ -150,8 +158,10 @@ class Runner:
         return (self.repos / name).resolve()
 
     def launch(self, item, prompt, resume=False):
-        if not self.room(item):
-            self.log(item, 'deferred: executor limit or repository busy')
+        reason = self.room(item)
+        if reason:
+            if not item['log'] or item['log'][-1]['event'] != reason:
+                self.log(item, reason)
             return False
         choice = self.choose(item, resume)
         if choice is None:
