@@ -68,6 +68,7 @@ def test_pass_order_prompt_session_and_notices(setup):
     r.run()
     assert p.started[0]['prompt'] == 'The exact prompt.\n'
     assert p.started[0]['tool'] == 'codex'
+    assert r.git.commit.call_count == 1
     assert item(r)['state'] == 'issued'
     r.run()
     assert item(r)['session'] == {'tool': 'codex', 'id': 'session-1', 'folder': str(r.repos / 'repo')}
@@ -78,6 +79,7 @@ def test_pass_order_prompt_session_and_notices(setup):
     assert all(e['actor'] == 'runner' for e in item(r)['log'])
     assert r.git.mock_calls[0][0] == 'pull'
     assert r.git.mock_calls[-1][0] == 'commit'
+    assert r.git.commit.call_count == 3
     assert len(p.started) == 1
     r.run()
     assert item(r)['state'] == 'in review'
@@ -88,8 +90,11 @@ def test_pass_order_prompt_session_and_notices(setup):
 def test_not_due(setup, field, value):
     r, p, _ = setup
     edit(r, lambda s: s.update({field: value}))
+    before = r.path.read_bytes()
     r.run()
     assert not p.started
+    assert r.path.read_bytes() == before
+    r.git.commit.assert_not_called()
 
 
 def test_dependency_accepted(setup):
@@ -493,7 +498,7 @@ def test_usage_unavailable_or_malformed(tmp_path, monkeypatch):
     assert claude_usage(tmp_path / '.claude/usage-now.json') is None
 
 
-def test_runner_real_git_pull_save_push(tmp_path, slice_data, monkeypatch):
+def test_runner_real_git_pull_does_not_commit_unchanged_state(tmp_path, slice_data, monkeypatch):
     import subprocess
     monkeypatch.setenv('GIT_CONFIG_GLOBAL', '/dev/null')
     monkeypatch.setenv('GIT_CONFIG_NOSYSTEM', '1')
@@ -510,11 +515,15 @@ def test_runner_real_git_pull_save_push(tmp_path, slice_data, monkeypatch):
     (local / '.gitignore').write_text('*.lock\n')
     git('-C', local, 'add', '.')
     git('-C', local, 'commit', '-m', 'fixture')
+    initial = git('-C', local, 'rev-parse', 'HEAD')
     git('-C', local, 'push', '-u', 'origin', 'main')
     r = Runner(path, processes=FakeProcesses(), clock=lambda: NOW, runs=tmp_path / 'runs')
     r.run()
     assert git('-C', remote, 'rev-parse', 'main') == git('-C', local, 'rev-parse', 'HEAD')
-    assert json.loads(git('-C', remote, 'show', 'main:state.json'))['slices'][0]['log'][-1]['actor'] == 'runner'
+    assert git('-C', local, 'rev-parse', 'HEAD') == initial
+    events = [entry['event'] for entry in json.loads(
+        git('-C', remote, 'show', 'main:state.json'))['slices'][0]['log']]
+    assert events == []
 
 
 def test_detached_starter_closes_stdin_and_writes_config(tmp_path, monkeypatch):
@@ -689,7 +698,7 @@ def test_empty_state_is_successful_without_an_empty_git_commit(setup):
 @pytest.mark.parametrize('phase', [None, 'running', 'ended', 'collected', 'pr', 'merged', 'node-step'])
 @pytest.mark.parametrize('attention_kind', [None, 'question', 'merge'])
 @pytest.mark.parametrize('tool', ['codex', 'claude'])
-def test_accepted_slices_only_log_skip(setup, phase, attention_kind, tool):
+def test_accepted_slices_do_not_change_or_log(setup, phase, attention_kind, tool):
     r, p, gh = setup
     attention = None if attention_kind is None else {
         'kind': attention_kind, 'body': 'Review this', 'since': NOW.isoformat(),
@@ -720,21 +729,22 @@ def test_accepted_slices_only_log_skip(setup, phase, attention_kind, tool):
     p.poll = Mock(wraps=p.poll)
     gh.checks.return_value = 'green', ''
     before = item(r)
+    state_before = r.path.read_bytes()
     for pass_number in (1, 2):
         r.run()
         after = item(r)
         assert {k: v for k, v in after.items() if k != 'log'} == {
             k: v for k, v in before.items() if k != 'log'
         }
-        assert after['log'] == before['log'] + [
-            {'at': NOW.isoformat(), 'actor': 'runner', 'event': 'skipped: accepted slice'}
-        ] * pass_number
+        assert after['log'] == before['log']
+        assert r.path.read_bytes() == state_before
         p.start.assert_not_called()
         p.poll.assert_not_called()
         gh.open.assert_not_called()
         gh.checks.assert_not_called()
         gh.merge.assert_not_called()
         assert not r.notices
+        r.git.commit.assert_not_called()
         assert not Path(str(r.path) + '.outbox.jsonl').exists()
         if job_path:
             assert job_path.read_bytes() == job_before
