@@ -97,20 +97,7 @@ def update(path, slice_id, command, actor, change, commit=False):
         at = now().isoformat()
         notice, warning = change(item, data, at)
         item["log"].append({"at": at, "actor": actor, "event": command})
-        validate(data)
-        payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-        temp = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False) as stream:
-                temp = stream.name
-                os.fchmod(stream.fileno(), path.stat().st_mode & 0o777)
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temp, path)
-        finally:
-            if temp and os.path.exists(temp):
-                os.unlink(temp)
+        save(path, data)
         if notice is not None:
             with outbox.open("a") as stream:
                 stream.write(json.dumps({"at": at, "id": slice_id, "event": command, "text": notice}, ensure_ascii=False) + "\n")
@@ -119,3 +106,21 @@ def update(path, slice_id, command, actor, change, commit=False):
         if commit:
             commit_state(path, outbox, command, slice_id)
         return warning
+
+
+def save(path, data):
+    """Validate and atomically replace state; caller holds the sidecar lock."""
+    validate(data)
+    payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False) as stream:
+            temp = stream.name
+            os.fchmod(stream.fileno(), path.stat().st_mode & 0o777)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        if temp and os.path.exists(temp):
+            os.unlink(temp)

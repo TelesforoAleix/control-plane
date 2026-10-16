@@ -116,17 +116,29 @@ def parser():
         sub.add_argument("id")
         if command in ("slot", "answer"):
             sub.add_argument("value", metavar="when" if command == "slot" else "text")
+    for command in ("run", "install-agent", "uninstall-agent"):
+        commands.add_parser(command, parents=[common])
     return root
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
+        if args.command == "uninstall-agent":
+            from .agent import uninstall
+            uninstall()
+            return 0
         path = getattr(args, "state", None) or os.environ.get("CPLANE_STATE")
         if not path:
             raise state.StateError("provide --state or CPLANE_STATE")
         path = Path(path).expanduser()
-        if args.command == "pending":
+        if args.command == "install-agent":
+            from .agent import install
+            install(path.resolve())
+        elif args.command == "run":
+            from .runner import Runner
+            Runner(path).run()
+        elif args.command == "pending":
             groups = pending(state.load(path))
             print(json.dumps(groups, indent=2, ensure_ascii=False) if args.json else render(groups))
         else:

@@ -2,8 +2,8 @@
 
 A scheduler's state file and its commands. `cplane` helps an owner schedule slices of
 coding work, answer questions, approve merges, and see what is pending. It records
-intent only: no command starts, resumes, or calls an executor. `start` sets a slot to
-now; `resume` clears a pause flag.
+intent through owner commands. `start` sets a slot to now; `resume` clears a pause
+flag. The separate `run` command starts and resumes Codex and Claude executors.
 
 Requires Python 3.13 or later and uv. Install the locked environment with `uv sync`.
 The only direct runtime dependency is the MIT-licensed `jsonschema` library.
@@ -112,10 +112,85 @@ Resolve synchronization in the state repository before retrying a mutation.
 Add `<state>.lock` to that repository's ignore rules; keep the outbox tracked.
 
 The tool never interprets brief paths, executor/model values or answer text as
-shell commands. Git runs as an argument array and uses the state repository's
+shell commands. The runner passes brief and answer text to the executor as a single
+argument; the executor itself can perform the work described by that text. Git runs as an argument array and uses the state repository's
 normal git configuration and hooks. Use a trusted local state repository. Python's
 `fcntl` locking targets macOS and Unix; Windows is not supported.
 
 Run `uv run pytest` for the synthetic fixture, concurrent writer, time, CLI, schema,
 and temporary bare-remote Git tests. CI runs the tests and gitleaks on every PR and
 on pushes to `main`. Main requires the `test` check and forbids force pushes.
+
+## Runner
+
+```sh
+export CPLANE_REPOS="$HOME/Code"
+export CPLANE_RUNS="$HOME/Library/Application Support/cplane/runs"
+uv run cplane --state /path/to/state.json run
+uv run cplane --state /path/to/state.json install-agent
+uv run cplane uninstall-agent
+```
+
+Only `run` starts or resumes executors. It makes one pass under the state lock:
+pull the state repository, collect finished turns, deliver answers and approvals,
+start due slices, validate and save state, append notices, then commit and push.
+The runner always syncs state in a git repository; it does not need `--commit`.
+Outside git it still saves state and notices, which is useful for temporary tests.
+Brief paths resolve relative to the state file's directory. Repository checkouts
+resolve as `$CPLANE_REPOS/<repository-name>` (default `~/Code`). Existing owner
+commands, the version 1 schema, and the outbox format are unchanged.
+
+A slice starts when ready, unpaused, at or after its slot, with every dependency
+accepted. Codex uses the slice's model when its latest five-hour usage is below
+100%. Otherwise Claude uses opus for a Sol model and sonnet for other models,
+provided its usage file is less than an hour old and below 90% for five hours.
+Missing usage is unavailable capacity. The next pass retries deferred work.
+Resumes retain the session's tool and model and wait for that tool's capacity;
+sessions cannot transfer between providers. At most two turns run concurrently,
+and only one per repository. Sessions whose local run metadata is missing still
+occupy a slot until reconciled. Use a single state file and consistent run directory
+for the scheduler.
+
+Codex receives the brief unchanged. Claude receives it followed by the GitHub
+instructions in `cplane/executors.py`: push the branch and return a waiting message
+with a fenced JSON PR request (`branch`, `title`, `body`, `node_steps`). The runner
+creates the PR and checks it on later passes. Failing checks raise escalation;
+pending checks wait. Green checks allow a merge, with owner approval first when
+`stop_before_merge` is true. After merging it resumes Claude with the merge SHA,
+or raises node-step attention if the request requires owner-node work. Codex
+handles its own GitHub work; approved Codex merge attention resumes it with the
+owner's approval. `answer` and `approve` only record the response; the next pass
+delivers it subject to capacity and concurrency limits.
+
+A handover moves the slice to `in review` and emits `finished`. Questions and
+escalations create attention; an escalation sets `escalated`. Ordinary waiting
+messages create node-step attention. A terminated turn without a valid, fresh
+final message raises escalation with the last 40 log lines. All runner actions
+append log entries with actor `runner`. Notices go to the existing local outbox;
+there is no external notification sender.
+
+The detached supervisor writes executor output, final replies, session IDs, exit
+markers and private turn metadata under `CPLANE_RUNS` (default
+`~/Library/Application Support/cplane/runs`). Each state path has its own directory,
+with one subdirectory per turn. Session IDs are recorded when they appear in the
+executor output; the initial session ID can be empty until collection. Codex final
+files must be newer than the turn's start; Claude replies come from
+`structured_output`. Run metadata supports collection across CLI restarts. Keep
+these files private like state and outbox: they contain prompts and answers.
+Do not delete them while a turn is active. Retain the same absolute state path.
+
+`install-agent` writes and bootstraps `~/Library/LaunchAgents/com.cplane.runner.plist`.
+It uses the current Python environment and checkout, an absolute state path,
+a 300-second interval, and `AbandonProcessGroup = true`. Logs go to
+`~/Library/Logs/cplane/runner.log` and `runner-error.log`. It captures PATH,
+CPLANE_REPOS and CPLANE_RUNS, since launchd does not inherit a terminal environment.
+Keep the Python environment, checkout and executor binaries available after
+installation. `uninstall-agent` unloads and removes only that agent; detached
+executors already running continue. Installation is a separate, explicit action.
+
+As with owner commands, state, outbox, run metadata and remote GitHub effects are
+separate writes, not a distributed transaction. Collection replies can be replayed
+when state saving fails; PR lookup and merge lookup recover completed GitHub steps.
+A crash in the launch/supervisor handoff may need inspection of the run directory;
+the runner conservatively reserves capacity rather than launching a duplicate.
+Sync failures retain the local state commit. Resolve them before another pass.
