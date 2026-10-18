@@ -12,7 +12,7 @@ import pytest
 from cplane import agent, state
 from cplane.cli import main
 from cplane.executors import CLAUDE_PARAGRAPH, Processes, command
-from cplane.runner import Runner, GitHub
+from cplane.runner import Runner, Git, GitHub
 
 NOW = datetime(2026, 10, 16, 10, tzinfo=timezone.utc)
 
@@ -50,6 +50,7 @@ def setup(tmp_path, slice_data, make_state):
     (tmp_path / 'briefs').mkdir()
     (tmp_path / 'briefs/W1.md').write_text('The exact prompt.\n')
     (tmp_path / 'repos/repo').mkdir(parents=True)
+    (tmp_path / 'repos/repo/.git').mkdir()
     processes, github = FakeProcesses(), FakeGitHub()
     runner = Runner(path, processes=processes, github=github, git=Mock(), clock=lambda: NOW,
                     codex_reader=lambda: 10, claude_reader=lambda: None,
@@ -101,6 +102,21 @@ def test_tidy_skips_busy_repository_and_failure_does_not_fail_pass(setup, capsys
     r.git.tidy.side_effect = OSError('simulated git failure')
     r.run()
     assert 'repo: tidy failed: simulated git failure' in capsys.readouterr().err
+
+
+def test_tidy_skips_missing_repository_folder(setup, capsys):
+    r, _, _ = setup
+    repo = r.repos / 'repo'
+    (repo / '.git').rmdir()
+    repo.rmdir()
+    edit(r, lambda s: s.update(state='planned', slot=None))
+    r.git = Git()
+    r.git.pull = Mock()
+    r.git.commit = Mock()
+
+    r.run()
+
+    assert capsys.readouterr().err == ''
 
 
 @pytest.mark.parametrize('field,value', [('state', 'planned'), ('paused', True), ('slot', None),

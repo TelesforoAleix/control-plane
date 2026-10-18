@@ -493,7 +493,7 @@ class Runner:
                 if is_busy:
                     busy.add(self.repo(item))
             for folder in sorted({self.repo(item) for item in self.data['slices']}):
-                if folder not in busy:
+                if folder not in busy and folder.is_dir() and (folder / '.git').exists():
                     try:
                         self.git.tidy(folder, now=self.instant)
                     except Exception as error:
