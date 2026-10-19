@@ -39,6 +39,7 @@ class FakeGitHub:
         self.repository = Mock(return_value='example/repo')
         self.open = Mock(return_value=12)
         self.find_pr = Mock(return_value=None)
+        self.is_open = Mock(return_value=True)
         self.checks = Mock(return_value=('pending', ''))
         self.merge = Mock(return_value='abc123')
 
@@ -1091,3 +1092,150 @@ def test_accepted_slices_do_not_change_or_log(setup, phase, attention_kind, tool
         assert not Path(str(r.path) + '.outbox.jsonl').exists()
         if job_path:
             assert job_path.read_bytes() == job_before
+
+
+@pytest.mark.parametrize('status,stop,expected', [
+    ('red', False, 'escalation'),
+    ('pending', False, None),
+    ('green', True, 'merge'),
+    ('green', False, None),
+])
+@pytest.mark.parametrize('source', ['branch', 'url', 'number'])
+def test_codex_waiting_ci_outcomes(setup, status, stop, expected, source):
+    r, p, gh = setup
+    edit(r, lambda s: s.update(stop_before_merge=stop))
+    r.run()
+    if source == 'branch':
+        gh.find_pr.return_value = 12
+    body = {'branch': 'Waiting for CI', 'url': 'CI: https://github.com/example/repo/pull/12',
+            'number': 'Waiting on PR #12'}[source]
+    p.finish('waiting', body)
+    r.run()
+    assert item(r)['pr'] == 12
+    assert item(r)['attention'] is None
+    assert r.jobs['voice/W1']['phase'] == 'pr'
+    gh.checks.assert_not_called()
+    gh.is_open.assert_called_once_with('example/repo', 12)
+    gh.checks.return_value = status, 'test' if status == 'red' else ''
+    r.run()
+    a = item(r)['attention']
+    assert (a['kind'] if a else None) == expected
+    if expected == 'escalation':
+        assert item(r)['state'] == 'escalated'
+        assert a['body'] == 'failing check: test'
+    elif expected == 'merge':
+        assert a['body'] == 'Approve PR #12'
+        assert not a['approved']
+        assert 'review' not in a
+    if status == 'green' and not stop:
+        assert len(p.started) == 2
+        assert p.started[-1]['prompt'] == 'CI is green on PR #12; merge it and continue.'
+        assert p.started[-1]['resume'] == 'session-1'
+        assert p.started[-1]['tool'] == 'codex'
+    else:
+        assert len(p.started) == 1
+    # A further pass neither resumes twice nor replaces an existing attention.
+    r.run()
+    assert item(r)['attention'] == a
+    assert len(p.started) == (2 if status == 'green' and not stop else 1)
+    gh.merge.assert_not_called()
+    gh.open.assert_not_called()
+
+
+@pytest.mark.parametrize('number,opened', [(None, True), (12, False)])
+def test_codex_waiting_without_open_pr_keeps_node_step(setup, number, opened):
+    r, p, gh = setup
+    r.run()
+    gh.find_pr.return_value = number
+    gh.is_open.return_value = opened
+    p.finish('waiting', 'Owner node work')
+    r.run()
+    r.run()
+    assert item(r)['attention']['kind'] == 'node-step'
+    assert item(r)['attention']['body'] == 'Owner node work'
+    gh.checks.assert_not_called()
+    assert len(p.started) == 1
+
+
+@pytest.mark.parametrize('stop,status', [(True, 'green'), (False, 'red'), (False, 'pending'), (False, 'green')])
+def test_codex_ci_watch_recovers_state_save_failures(setup, monkeypatch, stop, status):
+    r, p, gh = setup
+    edit(r, lambda s: s.update(stop_before_merge=stop))
+    r.run()
+    gh.find_pr.return_value = 12
+    p.finish('waiting', 'Waiting on CI')
+    save = state.save
+    monkeypatch.setattr(state, 'save', Mock(side_effect=OSError('disk unavailable')))
+    with pytest.raises(OSError):
+        r.run()
+    # On replay the branch might have changed. The saved PR number is authoritative.
+    gh.find_pr.side_effect = AssertionError('must recover saved PR')
+    monkeypatch.setattr(state, 'save', save)
+    r.run()
+    assert item(r)['pr'] == 12
+    gh.checks.return_value = status, 'test'
+    monkeypatch.setattr(state, 'save', Mock(side_effect=OSError('disk unavailable')))
+    with pytest.raises(OSError):
+        r.run()
+    monkeypatch.setattr(state, 'save', save)
+    r.run()
+    r.run()
+    if status == 'green' and not stop:
+        assert len(p.started) == 2
+        assert item(r)['attention'] is None
+        assert item(r)['session']['id'] == 'session-1'
+    else:
+        assert len(p.started) == 1
+        a = item(r)['attention']
+        if status == 'pending':
+            assert a is None
+        else:
+            assert a['kind'] == ('merge' if status == 'green' else 'escalation')
+
+
+def test_codex_green_waits_for_capacity_then_resumes_once(setup):
+    r, p, gh = setup
+    edit(r, lambda s: s.update(stop_before_merge=False))
+    r.run()
+    gh.find_pr.return_value = 12
+    p.finish('waiting', 'CI pending')
+    r.run()
+    gh.checks.return_value = 'green', ''
+    r.codex_reader = lambda: 100
+    r.run()
+    assert len(p.started) == 1
+    assert r.jobs['voice/W1']['phase'] == 'pr'
+    assert item(r)['attention'] is None
+    r.codex_reader = lambda: 0
+    r.run()
+    r.run()
+    assert len(p.started) == 2
+
+
+def test_codex_ci_merge_attention_review_approval(setup):
+    r, p, gh = setup
+    r.run()
+    gh.find_pr.return_value = 12
+    p.finish('waiting', 'CI pending')
+    r.run()
+    gh.checks.return_value = 'green', ''
+    r.run()
+    args = ['--state', str(r.path)]
+    assert main([*args, 'approve', 'voice/W1']) == 1
+    assert main([*args, '--actor', 'planner', 'review', 'voice/W1', 'Ready']) == 0
+    r.run()
+    assert item(r)['attention']['review']['verdict'] == 'Ready'
+    assert main([*args, 'approve', 'voice/W1']) == 0
+    r.run()
+    r.run()
+    assert len(p.started) == 2
+    assert p.started[-1]['prompt'] == 'The owner approves the merge.'
+    gh.merge.assert_not_called()
+
+
+@pytest.mark.parametrize('pr_state,expected', [('OPEN', True), ('CLOSED', False), ('MERGED', False)])
+def test_github_is_open(pr_state, expected):
+    gh = GitHub()
+    gh.call = Mock(return_value=json.dumps({'state': pr_state}))
+    assert gh.is_open('owner/repo', 12) is expected
+    gh.call.assert_called_once_with('owner/repo', 'pr', 'view', '12', '--json', 'state')

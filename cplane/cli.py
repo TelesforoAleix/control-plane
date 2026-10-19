@@ -35,6 +35,8 @@ def change_for(command, argument=None):
         elif command == "approve":
             if not item["attention"] or item["attention"]["kind"] != "merge":
                 raise state.StateError(f"{item['id']} has no merge attention")
+            if item["stop_before_merge"] and "review" not in item["attention"]:
+                raise state.StateError(f"{item['id']} needs a recorded planner review before approval; use cplane review")
             item["attention"]["approved"] = True
             notice = f"Approved merge for {item['id']}"
         elif command == "answer":
@@ -139,6 +141,9 @@ def parser():
     attention.add_argument("--kind", choices=planner.KINDS)
     attention.add_argument("--body")
     attention.add_argument("--clear", action="store_true")
+    review = commands.add_parser("review", parents=[common], help="record a planner review of merge attention")
+    review.add_argument("id")
+    review.add_argument("verdict")
     helps = {"slot": "schedule a ready slice", "unslot": "clear a slot", "start": "slot a ready slice now", "pause": "set paused", "resume": "clear paused", "approve": "approve merge attention", "answer": "answer a question or escalation"}
     for command in COMMANDS:
         sub = commands.add_parser(command, parents=[common], help=helps[command])
@@ -207,7 +212,7 @@ def main(argv=None):
                 details = "\n".join(f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in item.items())
                 folder = str(latest[1]) if latest else '(none)'
                 print(details + f'\nrun: {folder}')
-        elif args.command in ("add", "edit", "state", "attention"):
+        elif args.command in ("add", "edit", "state", "attention", "review"):
             event = None
             if args.command == "state":
                 event = f"state: {args.target}"

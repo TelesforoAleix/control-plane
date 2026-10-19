@@ -13,6 +13,10 @@
     "timestamp": {"type": "string", "format": "date-time"},
     "id": {"type": "string", "pattern": "^[^/\\s]+/[^/\\s]+$"},
     "tool": {"enum": ["codex", "claude"]},
+    "review": {
+      "type": "object", "additionalProperties": false, "required": ["verdict", "at", "actor"],
+      "properties": {"verdict": {"type": "string"}, "at": {"$ref": "#/$defs/timestamp"}, "actor": {"type": "string"}}
+    },
     "slice": {
       "type": "object", "additionalProperties": false,
       "required": ["id", "repo", "feature", "title", "state", "brief", "executor", "stop_before_merge", "depends_on", "slot", "paused", "session", "pr", "attention", "log"],
@@ -41,7 +45,7 @@
           "anyOf": [
             {"type": "null"},
             {"type": "object", "additionalProperties": false, "required": ["kind", "body", "since", "answer", "approved"],
-             "properties": {"kind": {"enum": ["question", "escalation", "merge", "node-step", "owner-check"]}, "body": {"type": "string"}, "since": {"$ref": "#/$defs/timestamp"}, "answer": {"type": ["string", "null"]}, "approved": {"type": "boolean"}}}
+             "properties": {"kind": {"enum": ["question", "escalation", "merge", "node-step", "owner-check"]}, "body": {"type": "string"}, "since": {"$ref": "#/$defs/timestamp"}, "answer": {"type": ["string", "null"]}, "approved": {"type": "boolean"}, "review": {"$ref": "#/$defs/review"}}}
           ]
         },
         "log": {"type": "array", "items": {

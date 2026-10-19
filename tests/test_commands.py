@@ -50,6 +50,7 @@ def test_start(make_state):
 @pytest.mark.parametrize("command,kind", [("approve", "merge"), ("answer", "question"), ("answer", "escalation")])
 def test_attention_success(make_state, slice_data, command, kind):
     slice_data["attention"] = attention(kind)
+    slice_data["stop_before_merge"] = False
     path = make_state([slice_data])
     args = [command, "voice/W1"] + (["Yes, proceed\nwith care"] if command == "answer" else [])
     assert main([*args, "--state", str(path)]) == 0
@@ -171,3 +172,21 @@ def test_parser_errors_one_line(capsys):
         main(["start"])
     assert exc.value.code != 0
     assert len(capsys.readouterr().err.splitlines()) == 1
+
+
+@pytest.mark.parametrize('tool', ['codex', 'claude'])
+def test_stop_before_merge_requires_review(make_state, slice_data, capsys, tool):
+    slice_data['executor']['tool'] = tool
+    slice_data['attention'] = attention('merge')
+    path = make_state()
+    before = path.read_bytes()
+    assert main(['--state', str(path), 'approve', 'voice/W1']) == 1
+    assert 'needs a recorded planner review' in capsys.readouterr().err
+    assert path.read_bytes() == before
+    assert not path.with_name(path.name + '.outbox.jsonl').exists()
+    assert main(['--state', str(path), '--actor', 'planner', 'review', 'voice/W1', 'Ready to merge']) == 0
+    review = load(path)['slices'][0]['attention']['review']
+    assert main(['--state', str(path), 'approve', 'voice/W1']) == 0
+    recorded = load(path)['slices'][0]['attention']
+    assert recorded['approved'] is True
+    assert recorded['review'] == review

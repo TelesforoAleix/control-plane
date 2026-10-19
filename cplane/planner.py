@@ -59,6 +59,13 @@ def change_for(args):
             if target == "planned":
                 item["slot"] = None
             item["state"] = target
+        elif args.command == "review":
+            if not item["attention"] or item["attention"]["kind"] != "merge":
+                raise StateError(f"{item['id']} has no merge attention to review")
+            item["attention"]["review"] = dict(verdict=args.verdict, at=at,
+                                               actor=getattr(args, "actor", "owner"))
+            first_line = args.verdict.split("\n", 1)[0].rstrip("\r")
+            return f"Reviewed {item['id']}: {first_line}", None
         elif args.command == "attention":
             if args.clear:
                 if args.kind is not None or args.body is not None:

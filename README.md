@@ -4,7 +4,7 @@ A scheduler's state file and its commands. `cplane` helps an owner schedule slic
 coding work, answer questions, approve merges, and see what is pending. It records
 intent through owner commands. `start` sets a slot to now; `resume` clears a pause
 flag. The separate `run` command starts and resumes Codex and Claude executors.
-Planning agents use `add`, `edit`, `state`, `attention`, and `show` to prepare
+Planning agents use `add`, `edit`, `state`, `attention`, `review`, and `show` to prepare
 briefs, mark slices ready, review handovers, and accept completed work.
 
 Requires Python 3.13 or later and uv. Install the locked environment with `uv sync`.
@@ -25,6 +25,7 @@ uv run cplane unslot example/W1
 uv run cplane start example/W1
 uv run cplane pause example/W1
 uv run cplane resume example/W1
+uv run cplane --actor planner review example/W1 'Reviewed the diff and tests; ready to merge'
 uv run cplane approve example/W1
 uv run cplane answer example/W1 'Use the existing interface'
 uv run cplane --actor owner --commit slot example/W1 '2026-10-19T03:00:00+02:00'
@@ -43,6 +44,7 @@ this repository contains only the schema and synthetic test fixtures.
 | `state <id> <state> [--session <tool>:<id>:<folder>] [--force --reason <text>]` | Record an allowed state transition. Quote states containing spaces. |
 | `attention <id> --kind <kind> --body <text>` | Record attention and append a notice. |
 | `attention <id> --clear` | Clear attention. |
+| `review <id> "<verdict>"` | Record a planner review on merge attention. |
 | `slot <id> <when>` / `unslot <id>` | Record or clear a scheduled time. |
 | `start <id>` | Slot a ready slice now. |
 | `pause <id>` / `resume <id>` | Set or clear the pause flag. |
@@ -88,6 +90,11 @@ answer and approval, and leaves the slice's state as recorded. Clearing attentio
 adds no notice. All planner writes accept `--actor` (default `owner`) and
 `--commit`, like the owner commands. `show --json` returns one slice object.
 
+`review` requires merge attention and records `review: {verdict, at, actor}` on
+that attention. It appends a notice, `Reviewed <id>: <first line of verdict>`.
+Setting new attention replaces any previous review. The review property is optional
+in version 1; existing state files remain valid.
+
 The version 1 shape is defined in [schema/slices.schema.json](schema/slices.schema.json)
 (JSON Schema draft 2020-12). The loader additionally checks uniqueness of slice IDs,
 which JSON Schema cannot express for one field of objects in an array. Unknown
@@ -120,7 +127,10 @@ A minimal synthetic state file:
 ```
 
 `slot` and `start` require `ready`. They name every unmet dependency in a warning
-but still record the slot. `approve` requires merge attention; `answer` requires
+but still record the slot. `approve` requires merge attention and, when
+`stop_before_merge` is true, a recorded planner review on that attention. The
+planner uses `review` before the owner approves. Slices without `stop_before_merge`
+retain the existing approval behaviour. `answer` requires
 question or escalation attention. Other owner mutations apply to any existing slice,
 including repeated calls. Refusals exit nonzero with one line on stderr and leave
 the state unchanged. A warning accompanies a successful command and exits zero.
@@ -152,7 +162,7 @@ to `owner`; the event is the command name. A stable sidecar lock serializes writ
 across replacement of the state file. Existing state permissions are preserved.
 Readers see a complete old or new state file.
 
-`slot`, `start`, `approve`, `answer`, and setting `attention` also append one JSON line containing
+`slot`, `start`, `approve`, `answer`, `review`, and setting `attention` also append one JSON line containing
 `{at, id, event, text}` to `<state>.outbox.jsonl` under the same lock. Nothing sends
 these notices. State replacement and outbox append are separate filesystem
 operations: an I/O failure or crash between them can leave a saved state without
@@ -222,14 +232,19 @@ creates the PR and checks it on later passes. Failing checks raise escalation;
 pending checks wait. Green checks allow a merge, with owner approval first when
 `stop_before_merge` is true. After merging it resumes Claude with the merge SHA,
 or raises node-step attention if the request requires owner-node work. Codex
-handles its own GitHub work; approved Codex merge attention resumes it with the
-owner's approval. `answer` and `approve` only record the response; the next pass
-delivers it subject to capacity and concurrency limits.
+handles its own GitHub work. When it returns `waiting` with an open PR found by
+branch lookup or a PR number in its reply, the runner watches CI on later passes.
+Red checks raise escalation naming the failing check; pending checks wait. Green
+checks create `Approve PR #<n>` merge attention for `stop_before_merge` slices,
+requiring a planner review before owner approval. Otherwise the runner resumes
+Codex with `CI is green on PR #<n>; merge it and continue.` Approved Codex merge
+attention resumes it with the owner's approval. `answer` and `approve` only record
+the response; the next pass delivers it subject to capacity and concurrency limits.
 
 A handover moves the slice to `in review` and emits `finished`. Questions and
 escalations create attention; an escalation sets `escalated`. Ordinary waiting
-messages create node-step attention. A terminated turn without a valid, fresh
-final message raises escalation with a summary of the tool, exit code and first
+messages without a PR to watch create node-step attention. A terminated turn
+without a valid, fresh final message raises escalation with a summary of the tool, exit code and first
 stderr error line, followed by the last 40 log lines. All runner actions
 append log entries with actor `runner`. Notices go to the existing local outbox;
 there is no external notification sender.

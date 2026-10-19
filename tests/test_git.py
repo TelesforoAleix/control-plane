@@ -213,3 +213,16 @@ def test_planner_commit_and_push(git_state, command):
     if command == 'attention':
         notice = json.loads(git(remote, 'show', 'main:slices.json.outbox.jsonl'))
         assert notice['event'] == 'attention'
+
+
+def test_review_commit_and_push(git_state):
+    path, remote, _ = git_state
+    assert main(['--state', str(path), 'attention', 'voice/W1', '--kind', 'merge', '--body', 'Approve PR #12']) == 0
+    assert main(['--state', str(path), 'review', 'voice/W1', 'Ready\nDiff checked', '--actor', 'planner', '--commit']) == 0
+    assert git(remote, 'rev-parse', 'main') == git(path.parent, 'rev-parse', 'HEAD')
+    assert git(remote, 'log', '-1', '--format=%s') == 'cplane: review voice/W1'
+    item = json.loads(git(remote, 'show', 'main:slices.json'))['slices'][0]
+    assert item['attention']['review']['actor'] == 'planner'
+    assert item['attention']['review']['verdict'] == 'Ready\nDiff checked'
+    notices = git(remote, 'show', 'main:slices.json.outbox.jsonl').splitlines()
+    assert json.loads(notices[-1])['text'] == 'Reviewed voice/W1: Ready'

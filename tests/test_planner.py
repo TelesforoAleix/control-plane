@@ -276,3 +276,34 @@ def test_ready_brief_can_be_set_through_edit(make_state, slice_data):
     assert invoke(path, 'edit', 'voice/W1', '--brief', 'briefs/new.md') == 0
     assert invoke(path, 'state', 'voice/W1', 'ready') == 0
     assert load(path)['slices'][0]['state'] == 'ready'
+
+
+@pytest.mark.parametrize('kind', [None, 'question', 'escalation', 'node-step', 'owner-check'])
+def test_review_requires_merge_attention(make_state, slice_data, capsys, kind):
+    from conftest import attention
+    slice_data['attention'] = attention(kind) if kind else None
+    path = make_state()
+    before = path.read_bytes()
+    assert invoke(path, 'review', 'voice/W1', 'Reviewed') == 1
+    assert 'no merge attention to review' in capsys.readouterr().err
+    assert path.read_bytes() == before
+    assert not notice_path(path).exists()
+
+
+def test_review_records_actor_timestamp_and_first_line_notice(make_state, slice_data):
+    from conftest import attention
+    slice_data['attention'] = attention('merge')
+    path = make_state()
+    verdict = 'Ready to merge\nChecked tests and diff'
+    assert invoke(path, 'review', 'voice/W1', verdict, '--actor', 'orchestrator') == 0
+    item = load(path)['slices'][0]
+    at = item['log'][-1]['at']
+    assert item['attention'] == dict(slice_data['attention'], review={
+        'verdict': verdict, 'at': at, 'actor': 'orchestrator'})
+    assert item['log'][-1] == dict(at=at, actor='orchestrator', event='review')
+    assert datetime.fromisoformat(at).utcoffset() is not None
+    assert json.loads(notice_path(path).read_text()) == dict(
+        at=at, id='voice/W1', event='review', text='Reviewed voice/W1: Ready to merge')
+    # Replacing attention must remove the review and require a fresh one.
+    assert invoke(path, 'attention', 'voice/W1', '--kind', 'merge', '--body', 'New PR') == 0
+    assert 'review' not in load(path)['slices'][0]['attention']

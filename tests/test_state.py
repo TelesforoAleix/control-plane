@@ -106,3 +106,26 @@ def test_outbox_append(make_state):
         state.update(path, "voice/W1", command, "owner", change_for(command, "2026-10-19T03:00:00+02:00"))
     lines = Path(str(path) + ".outbox.jsonl").read_text().splitlines()
     assert [json.loads(line)["event"] for line in lines] == ["slot", "start"]
+
+
+def test_version_one_attention_without_review_still_validates(make_state, slice_data):
+    from conftest import attention
+    slice_data['attention'] = attention('merge')
+    path = make_state()
+    assert state.load(path) == dict(version=1, slices=[slice_data])
+
+
+@pytest.mark.parametrize('review', [
+    None, 'approved', {},
+    {'verdict': 'OK', 'at': '2026-10-19T12:00:00+02:00'},
+    {'verdict': 1, 'at': '2026-10-19T12:00:00+02:00', 'actor': 'planner'},
+    {'verdict': 'OK', 'at': '2026-10-19T12:00:00', 'actor': 'planner'},
+    {'verdict': 'OK', 'at': 'bad', 'actor': 'planner'},
+    {'verdict': 'OK', 'at': '2026-10-19T12:00:00+02:00', 'actor': None},
+    {'verdict': 'OK', 'at': '2026-10-19T12:00:00+02:00', 'actor': 'planner', 'extra': True},
+])
+def test_malformed_review_rejected(make_state, slice_data, review):
+    from conftest import attention
+    slice_data['attention'] = dict(attention('merge'), review=review)
+    with pytest.raises(state.StateError, match='invalid state'):
+        state.load(make_state())
