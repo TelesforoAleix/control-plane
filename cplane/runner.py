@@ -146,6 +146,10 @@ class GitHub:
                 pending = True
         return ('pending' if pending else 'green'), ''
 
+    def is_open(self, repo, number):
+        info = json.loads(self.call(repo, 'pr', 'view', str(number), '--json', 'state'))
+        return info['state'] == 'OPEN'
+
     def merge(self, repo, number):
         info = json.loads(self.call(repo, 'pr', 'view', str(number), '--json', 'state,mergeCommit'))
         if info['state'] != 'MERGED':
@@ -303,6 +307,8 @@ class Runner:
 
     def apply_final(self, item, job):
         final = job.get('final')
+        if job['tool'] == 'codex' and job.get('pr'):
+            item['pr'] = job['pr']
         if job['tool'] == 'codex' and final and item['pr'] is None:
             branch = self.git.branch(job['repo'])
             item['pr'] = self.github.find_pr(self.github_repo(item), branch)
@@ -321,6 +327,12 @@ class Runner:
             self.log(item, 'finished', True)
         elif final['kind'] in ('question', 'escalation'):
             self.attention(item, final['kind'], final['body'])
+        elif (job['tool'] == 'codex' and final['kind'] == 'waiting'
+              and (job.get('pr') or (item['pr'] is not None
+                   and self.github.is_open(self.github_repo(item), item['pr'])))):
+            # Keep the number with the collected reply so a failed state save can replay it.
+            item['pr'] = job['pr'] = job.get('pr') or item['pr']
+            job['phase'] = 'pr'
         elif job['tool'] == 'claude' and re.match(r'\s*```', final['body']):
             match = re.match(r'\s*```(?:json)?\s*\n(.*?)\n```', final['body'], re.S)
             try:
@@ -390,7 +402,8 @@ class Runner:
             return
         # Recover PR number if creation succeeded but saving state did not.
         if item['pr'] is None:
-            item['pr'] = self.github.open(self.github_repo(item), job['request'])
+            item['pr'] = (job['pr'] if job['tool'] == 'codex'
+                          else self.github.open(self.github_repo(item), job['request']))
         status, failing = self.github.checks(self.github_repo(item), item['pr'])
         self.log(item, 'checks: ' + status)
         if status == 'red':
@@ -398,6 +411,11 @@ class Runner:
         elif status == 'green':
             if item['stop_before_merge']:
                 self.attention(item, 'merge', f'Approve PR #{item["pr"]}')
+            elif job['tool'] == 'codex':
+                if item['session'] and item['session']['id']:
+                    self.launch(item, f'CI is green on PR #{item["pr"]}; merge it and continue.', resume=True)
+                else:
+                    self.defer(item, 'deferred: session unavailable')
             else:
                 self.merge(item, job)
 
