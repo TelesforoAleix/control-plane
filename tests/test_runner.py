@@ -1239,3 +1239,45 @@ def test_github_is_open(pr_state, expected):
     gh.call = Mock(return_value=json.dumps({'state': pr_state}))
     assert gh.is_open('owner/repo', 12) is expected
     gh.call.assert_called_once_with('owner/repo', 'pr', 'view', '12', '--json', 'state')
+
+
+def test_frontline_start_schedules_in_same_pass(setup):
+    from cplane.orders import Collector
+    r, processes, _ = setup
+    edit(r, lambda s: s.update(slot=None))
+    current = item(r)
+    queued = dict(id='start-1', created=NOW.isoformat(), action='start', slice=current['id'],
+                  argument=None, expect=dict(state='ready', paused=False, attention=None))
+    client = Mock()
+    client.request.side_effect = [{'orders': [queued]}, None]
+    r.orders = Collector(client=client, tmux=Mock())
+    # start uses the same real clock as the terminal command.
+    r.clock = lambda: datetime.now(timezone.utc) + timedelta(seconds=1)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv('CPLANE_ORDERS_URL', 'http://127.0.0.1:1')
+        r.run()
+    assert len(processes.started) == 1
+    assert item(r)['state'] == 'issued'
+    assert item(r)['log'][0]['actor'] == 'frontline'
+
+
+@pytest.mark.parametrize('failure', ['timeout', '503', 'connection', 'no-config'])
+def test_frontline_unavailable_does_not_block_scheduling(setup, monkeypatch, failure, capsys):
+    from urllib.error import HTTPError, URLError
+    from cplane.orders import Collector
+    r, processes, _ = setup
+    client = Mock()
+    if failure == 'no-config':
+        monkeypatch.delenv('CPLANE_ORDERS_URL', raising=False)
+    else:
+        monkeypatch.setenv('CPLANE_ORDERS_URL', 'http://127.0.0.1:1')
+        client.request.side_effect = {
+            'timeout': TimeoutError('private address'),
+            '503': HTTPError('private address', 503, 'locked', {}, None),
+            'connection': URLError('private address'),
+        }[failure]
+    r.orders = Collector(client=client, tmux=Mock())
+    r.run()
+    assert len(processes.started) == 1
+    assert 'private address' not in capsys.readouterr().err
+    assert client.request.call_count == (0 if failure == 'no-config' else 1)

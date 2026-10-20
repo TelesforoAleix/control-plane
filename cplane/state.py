@@ -86,31 +86,37 @@ def commit_state(path, outbox, command, slice_id):
 
 def update(path, slice_id, command, actor, change, commit=False, *, create=None, event=None):
     path = Path(path).expanduser().resolve()
-    outbox = Path(str(path) + ".outbox.jsonl")
     # A stable sidecar inode is necessary: locking the replaced file loses exclusion.
     with Path(str(path) + ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        data = load(path)
-        item = next((item for item in data["slices"] if item["id"] == slice_id), None)
-        if create is not None:
-            if item is not None:
-                raise StateError(f"slice already exists: {slice_id}")
-            item = create()
-            data["slices"].append(item)
-        elif item is None:
-            raise StateError(f"unknown slice: {slice_id}")
-        at = now().isoformat()
-        notice, warning = change(item, data, at)
-        item["log"].append({"at": at, "actor": actor, "event": event or command})
-        save(path, data)
-        if notice is not None:
-            with outbox.open("a") as stream:
-                stream.write(json.dumps({"at": at, "id": slice_id, "event": command, "text": notice}, ensure_ascii=False) + "\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-        if commit:
-            commit_state(path, outbox, command, slice_id)
-        return warning
+        return update_locked(path, slice_id, command, actor, change, commit,
+                             create=create, event=event)
+
+
+def update_locked(path, slice_id, command, actor, change, commit=False, *, create=None, event=None):
+    """The shared command path for callers already holding the state sidecar lock."""
+    outbox = Path(str(path) + ".outbox.jsonl")
+    data = load(path)
+    item = next((item for item in data["slices"] if item["id"] == slice_id), None)
+    if create is not None:
+        if item is not None:
+            raise StateError(f"slice already exists: {slice_id}")
+        item = create()
+        data["slices"].append(item)
+    elif item is None:
+        raise StateError(f"unknown slice: {slice_id}")
+    at = now().isoformat()
+    notice, warning = change(item, data, at)
+    item["log"].append({"at": at, "actor": actor, "event": event or command})
+    save(path, data)
+    if notice is not None:
+        with outbox.open("a") as stream:
+            stream.write(json.dumps({"at": at, "id": slice_id, "event": command, "text": notice}, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    if commit:
+        commit_state(path, outbox, command, slice_id)
+    return warning
 
 
 def save(path, data):

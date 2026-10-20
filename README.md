@@ -212,6 +212,42 @@ Brief paths resolve relative to the state file's directory. Repository checkouts
 resolve as `$CPLANE_REPOS/<repository-name>` (default `~/Code`). Existing owner
 commands, the version 1 schema, and the outbox format are unchanged.
 
+At the start of every pass, after pulling state and before scheduling, the runner
+collects confirmed owner orders from the node's HTTP endpoint. It handles `start`,
+`slot`, `pause`, `resume`, `answer`, `approve`, and `orchestrator`. Slice orders
+must still match the state, pause flag, and attention kind/timestamp confirmed by
+the owner. Changed or missing slices are dropped with an outbox notice. Commands
+use the existing validation and locked atomic update path with actor `frontline`;
+merge approval still requires a planner review when configured. A start can run in
+that same pass. Order notices and collector logs omit argument text; answers remain
+in state, as with the terminal command.
+
+Configure the private base URL through `CPLANE_ORDERS_URL`, or put it alone in
+`~/Library/Application Support/cplane/orders-url`, beside `runs`. With a custom
+`CPLANE_RUNS`, the file is in that run directory's parent. Keep the file private
+and outside git. The installed launchd job reads this file on every pass; it does
+not capture `CPLANE_ORDERS_URL` from the installing terminal. To turn collection
+off, remove the file and unset the variable. An explicitly empty variable also
+disables collection for that invocation. Without configuration it skips quietly.
+Each HTTP request has a ten-second timeout and no retry within the pass; an
+unreachable or locked node logs one line without its address and scheduling
+continues. A failed acknowledgement waits until a later pass.
+
+Order receipts live in the state-specific run folder's `orders` directory, outside
+the scheduling state. They record IDs and outcomes before acknowledgement, so a
+lost acknowledgement is re-sent without executing again. Keep these receipts when
+retaining the same state path. An interrupted dispatch is conservatively recorded
+as failed and never automatically repeated; inspect local state before issuing a
+replacement order. State, outbox, receipts, tmux, and HTTP acknowledgements remain
+separate filesystem/process/network operations.
+
+An `orchestrator` order opens one detached window in the `frontline` tmux session,
+creating that session when needed. Targets must name a repository in state with a
+folder under `CPLANE_REPOS`, or `development` for the state file's directory. An
+existing window of that name is refused. The window runs `claude` with the owner's
+task verbatim in one prompt argument; order text never enters a shell. Answers and
+tasks longer than 4000 characters are refused.
+
 A slice starts when ready, unpaused, at or after its slot, with every dependency
 accepted. Accepted slices are skipped with a log entry on each pass; the runner
 does not start, resume, deliver to, merge for, or collect into them, including when
