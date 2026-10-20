@@ -912,6 +912,31 @@ def test_detached_starter_closes_stdin_and_writes_config(tmp_path, monkeypatch):
     assert (tmp_path / 'request.json').stat().st_mode & 0o777 == 0o600
 
 
+def test_detached_supervisor_runs_as_importable_module(tmp_path, monkeypatch):
+    import time
+
+    run = tmp_path / 'run'
+    run.mkdir()
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    codex = bin_dir / 'codex'
+    codex.write_text('#!/bin/sh\nexit 0\n')
+    codex.chmod(0o755)
+    monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
+    job = {'tool': 'codex', 'run': str(run), 'repo': str(repo), 'model': 'stub', 'prompt': 'test'}
+
+    Processes().start(job)
+
+    deadline = time.monotonic() + 5
+    while not (run / 'exit.json').exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert (run / 'exit.json').exists()
+    assert json.loads((run / 'exit.json').read_text())['code'] == 0
+    assert 'Traceback' not in (run / 'supervisor.log').read_text()
+
+
 @pytest.mark.parametrize('reply', ['{', '{"kind":"unknown","body":"x"}', '{"kind":"handover","body":1}'])
 def test_invalid_final_escalates_not_handover(tmp_path, reply):
     import time
