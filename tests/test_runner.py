@@ -13,6 +13,7 @@ from cplane import agent, state
 from cplane.cli import main
 from cplane.executors import CLAUDE_PARAGRAPH, Processes, command
 from cplane.runner import Runner, Git, GitHub
+from cplane.text_bounds import TAIL_LIMIT
 
 NOW = datetime(2026, 10, 16, 10, tzinfo=timezone.utc)
 
@@ -690,6 +691,31 @@ def test_process_exit_summary_uses_first_stderr_line(tmp_path):
     done, _, _, tail = Processes().poll(job)
     assert done
     assert tail.startswith('codex exec exited 2: unexpected argument --foo\n')
+
+
+def test_huge_process_tail_is_bounded_and_keeps_summary_and_output_end(tmp_path):
+    (tmp_path / 'exit.json').write_text('{"code":2}')
+    (tmp_path / 'stderr.log').write_text('usage limit reached\n')
+    (tmp_path / 'turn.jsonl').write_text('FIRST OUTPUT LINE\n' + 'x' * 20_000 + '\nLAST OUTPUT LINE')
+    job = {'tool': 'codex', 'run': str(tmp_path), 'started_ns': 0, 'pid': 999999}
+    done, _, _, tail = Processes().poll(job)
+    assert done
+    assert len(tail) <= TAIL_LIMIT
+    assert tail.startswith('codex exec exited 2: usage limit reached\n… [')
+    assert 'full output in the run folder' in tail
+    assert 'LAST OUTPUT LINE' in tail
+
+
+def test_attention_log_is_one_bounded_line_and_body_is_bounded(setup):
+    r, _, _ = setup
+    r.at = NOW.isoformat()
+    candidate = item(r)
+    r.attention(candidate, 'escalation', 'first line\n' + 'x' * 20_000)
+    assert len(candidate['attention']['body']) <= 8_000
+    event = candidate['log'][-1]['event']
+    assert len(event) <= 500
+    assert '\n' not in event
+    assert event.startswith('escalation: first line')
 
 
 def test_show_run_folder_and_final(tmp_path, make_state, monkeypatch, capsys):

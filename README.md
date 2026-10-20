@@ -45,6 +45,7 @@ this repository contains only the schema and synthetic test fixtures.
 | `attention <id> --kind <kind> --body <text>` | Record attention and append a notice. |
 | `attention <id> --clear` | Clear attention. |
 | `review <id> "<verdict>"` | Record a planner review on merge attention. |
+| `compact` | Bound oversized runner log events and attention bodies in every slice. |
 | `slot <id> <when>` / `unslot <id>` | Record or clear a scheduled time. |
 | `start <id>` | Slot a ready slice now. |
 | `pause <id>` / `resume <id>` | Set or clear the pause flag. |
@@ -89,6 +90,13 @@ Attention kinds are `question`, `escalation`, `merge`, `node-step`, and
 answer and approval, and leaves the slice's state as recorded. Clearing attention
 adds no notice. All planner writes accept `--actor` (default `owner`) and
 `--commit`, like the owner commands. `show --json` returns one slice object.
+
+The runner stores failure tails up to 4,000 characters, attention bodies up to
+8,000 characters, and log events up to 500 characters. `attention` log entries
+contain the kind and the body's first line. `compact` applies the log and body
+limits to existing slices under the state lock; it reports cut counts and the
+state file size before and after. Use `--commit` to commit and sync the compacted
+state. It does not change answers or review verdicts.
 
 `review` requires merge attention and records `review: {verdict, at, actor}` on
 that attention. It appends a notice, `Reviewed <id>: <first line of verdict>`.

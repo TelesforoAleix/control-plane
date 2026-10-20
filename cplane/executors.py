@@ -6,6 +6,8 @@ import subprocess
 import sys
 import time
 
+from .text_bounds import TAIL_LIMIT, cut, failure_tail
+
 FINAL_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "required": ["kind", "body"],
@@ -127,7 +129,7 @@ class Processes:
         errors = folder / 'stderr.log'
         if errors.exists():
             lines += errors.read_text(errors='replace').splitlines()
-        tail = '\n'.join(lines[-40:])
+        output_tail = '\n'.join(lines[-40:])
         if done:
             exit_file = folder / 'exit.json'
             if exit_file.exists():
@@ -138,7 +140,12 @@ class Processes:
                 error_lines = errors.read_text(errors='replace').splitlines() if errors.exists() else []
                 first_error = next((line.strip() for line in error_lines if line.strip()), 'no stderr output')
                 tool = 'codex' if job['tool'] == 'codex' else 'claude'
-                tail = f'{tool} exec exited {code}: {first_error}' + ('\n' + tail if tail else '')
+                summary = f'{tool} exec exited {code}: {first_error}'
+                tail = failure_tail(summary, output_tail)
+            else:
+                tail = cut(output_tail, TAIL_LIMIT)
+        else:
+            tail = cut(output_tail, TAIL_LIMIT)
         return done, session, final if valid else None, tail
 
 
