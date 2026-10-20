@@ -71,7 +71,7 @@ class Processes:
         atomic_json(folder / 'request.json', job)
         # The supervisor is outside the CLI process group and closes all terminal FDs.
         with (folder / 'supervisor.log').open('ab') as log:
-            proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), str(folder)],
+            proc = subprocess.Popen([sys.executable, '-m', 'cplane.executors', str(folder)],
                                     stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                     start_new_session=True, close_fds=True)
         job['pid'] = proc.pid
