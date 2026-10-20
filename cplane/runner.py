@@ -13,6 +13,7 @@ import traceback
 import uuid
 
 from . import state
+from .orders import Collector
 from .executors import Processes, atomic_json, CLAUDE_PARAGRAPH
 from .times import now
 
@@ -160,8 +161,9 @@ class GitHub:
 
 class Runner:
     def __init__(self, path, *, processes=None, github=None, git=None, clock=now,
-                 codex_reader=codex_usage, claude_reader=claude_usage, runs=None, repos=None):
+                 codex_reader=codex_usage, claude_reader=claude_usage, runs=None, repos=None, orders=None):
         self.path = Path(path).expanduser().resolve()
+        self.orders = orders or Collector()
         self.processes = processes or Processes()
         self.github = github or GitHub()
         self.git = git or Git()
@@ -423,8 +425,11 @@ class Runner:
         with Path(str(self.path) + '.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.git.pull(self.path)
+            orders_changed = self.orders.collect(self)
             self.data = state.load(self.path)
             if not self.data["slices"]:
+                if orders_changed:
+                    self.git.commit(self.path)
                 return  # Nothing to mutate or commit in an empty scheduler.
             state_before = json.dumps(self.data, ensure_ascii=False, separators=(',', ':'))
             self.instant = self.clock()
@@ -500,7 +505,7 @@ class Runner:
                         stream.write(json.dumps(notice, ensure_ascii=False) + '\n')
                     stream.flush()
                     os.fsync(stream.fileno())
-            if changed or self.notices:
+            if orders_changed or changed or self.notices:
                 self.git.commit(self.path)
             busy = set()
             for item in self.data['slices']:
