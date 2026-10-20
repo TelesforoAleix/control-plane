@@ -1,6 +1,7 @@
 """Owner and planner commands for the scheduling state file."""
 import argparse
 from datetime import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ import sys
 from . import state
 from . import planner
 from .times import LOCAL, parse_when
+from .text_bounds import ATTENTION_LIMIT, LOG_LIMIT, cut
 
 
 COMMANDS = ("slot", "unslot", "start", "pause", "resume", "approve", "answer")
@@ -150,6 +152,7 @@ def parser():
         sub.add_argument("id")
         if command in ("slot", "answer"):
             sub.add_argument("value", metavar="when" if command == "slot" else "text")
+    commands.add_parser("compact", parents=[common], help="bound oversized runner text in state")
     for command in ("run", "install-agent", "uninstall-agent"):
         commands.add_parser(command, parents=[common])
     return root
@@ -172,6 +175,29 @@ def main(argv=None):
         elif args.command == "run":
             from .runner import Runner
             Runner(path).run()
+        elif args.command == "compact":
+            path = path.resolve()
+            with Path(str(path) + ".lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                before = path.stat().st_size
+                data = state.load(path)
+                logs = attentions = 0
+                for item in data["slices"]:
+                    for entry in item["log"]:
+                        event = entry["event"]
+                        if len(event) > LOG_LIMIT:
+                            entry["event"] = cut(event, LOG_LIMIT)
+                            logs += 1
+                    attention = item["attention"]
+                    if attention and len(attention["body"]) > ATTENTION_LIMIT:
+                        attention["body"] = cut(attention["body"], ATTENTION_LIMIT)
+                        attentions += 1
+                if logs or attentions:
+                    state.save(path, data)
+                    if getattr(args, "commit", False):
+                        state.commit_state(path, Path(str(path) + ".outbox.jsonl"), "compact", "state")
+                after = path.stat().st_size
+            print(f"cut {logs} log entries and {attentions} attention bodies; size {before} -> {after} bytes")
         elif args.command == "pending":
             groups = pending(state.load(path))
             print(json.dumps(groups, indent=2, ensure_ascii=False) if args.json else render(groups))

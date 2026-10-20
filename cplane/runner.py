@@ -15,6 +15,7 @@ import uuid
 from . import state
 from .orders import Collector
 from .executors import Processes, atomic_json, CLAUDE_PARAGRAPH
+from .text_bounds import ATTENTION_LIMIT, LOG_LIMIT, cut, cut_line
 from .times import now
 
 CODEX_WORKTREES = Path.home() / '.codex/worktrees'
@@ -175,6 +176,7 @@ class Runner:
         self.notices = []
 
     def log(self, item, event, notice=False):
+        event = cut_line(event, LOG_LIMIT)
         item['log'].append({'at': self.at, 'actor': 'runner', 'event': event})
         if notice:
             self.notices.append({'at': self.at, 'id': item['id'], 'event': event.split(':')[0], 'text': event})
@@ -184,11 +186,12 @@ class Runner:
             self.log(item, reason)
 
     def attention(self, item, kind, body):
+        body = cut(body, ATTENTION_LIMIT)
         item['attention'] = {'kind': kind, 'body': body, 'since': self.at, 'answer': None, 'approved': False}
         if kind == 'escalation':
             item['state'] = 'escalated'
-        self.log(item, f'{kind}: {body}', True)
-        self.log(item, f'{kind}: {body}', True)
+        first_line = body.partition('\n')[0]
+        self.log(item, f'{kind}: {first_line}', True)
 
     def slice_failure(self, item, stage):
         lines = traceback.format_exc().strip().splitlines()

@@ -174,6 +174,30 @@ def test_parser_errors_one_line(capsys):
     assert len(capsys.readouterr().err.splitlines()) == 1
 
 
+def test_compact_bounds_oversized_text_and_is_idempotent(make_state, slice_data, capsys):
+    slice_data['log'] = [{"at": "2026-10-15T00:00:00+02:00", "actor": "runner", "event": "x" * 800_000}]
+    slice_data['attention'] = attention('question')
+    slice_data['attention']['body'] = 'body ' * 3_000
+    slice_data['attention']['answer'] = 'owner answer ' * 100
+    path = make_state([slice_data])
+    before = path.stat().st_size
+
+    assert main(['--state', str(path), 'compact']) == 0
+    output = capsys.readouterr().out
+    first = load(path)['slices'][0]
+    after = path.stat().st_size
+    assert after < before
+    assert 'cut 1 log entries and 1 attention bodies' in output
+    assert len(first['log'][0]['event']) <= 500
+    assert len(first['attention']['body']) <= 8_000
+    assert first['attention']['answer'] == 'owner answer ' * 100
+    compacted = path.read_bytes()
+
+    assert main(['--state', str(path), 'compact']) == 0
+    assert path.read_bytes() == compacted
+    assert 'cut 0 log entries and 0 attention bodies' in capsys.readouterr().out
+
+
 @pytest.mark.parametrize('tool', ['codex', 'claude'])
 def test_stop_before_merge_requires_review(make_state, slice_data, capsys, tool):
     slice_data['executor']['tool'] = tool
