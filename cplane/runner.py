@@ -1,5 +1,5 @@
 """One locked scheduling pass. Adapters keep external effects fakeable."""
-from datetime import datetime
+from datetime import datetime, timedelta
 import fcntl
 import hashlib
 import json
@@ -23,6 +23,15 @@ WORKTREE_MAX_AGE = 7 * 24 * 60 * 60
 
 
 def codex_usage(folder=None):
+    primary = codex_primary(folder)
+    if primary:
+        if primary.get('resets_at') is not None and primary['resets_at'] <= time.time():
+            return 0
+        return primary.get('used_percent')
+    return None
+
+
+def codex_primary(folder=None):
     paths = Path(folder or Path.home() / '.codex/sessions').rglob('*.jsonl')
     newest = max(paths, key=lambda p: p.stat().st_mtime_ns, default=None)
     if newest:
@@ -31,12 +40,24 @@ def codex_usage(folder=None):
             try:
                 limits = json.loads(line).get('payload', {}).get('rate_limits')
                 if limits and limits.get('primary'):
-                    primary = limits['primary']
-                    if primary.get('resets_at') is not None and primary['resets_at'] <= time.time():
-                        return 0
-                    return primary.get('used_percent')
+                    return limits['primary']
             except (ValueError, KeyError, TypeError, AttributeError):
                 continue
+    return None
+
+
+def usage_limit_message(tail):
+    for line in tail.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if event.get('type') != 'turn.failed':
+            continue
+        error = event.get('error')
+        message = error.get('message', '') if isinstance(error, dict) else ''
+        if isinstance(message, str) and re.search(r'usage limit', message, re.I):
+            return message
     return None
 
 
@@ -210,12 +231,11 @@ class Runner:
             tool = item['session']['tool']
             model = self.jobs[item['id']]['model']
         else:
-            tool = 'codex'
+            tool = item['executor']['tool']
         if tool == 'codex':
             codex = self.codex_reader()
-            if isinstance(codex, (int, float)) and 0 <= codex < 100:
+            if isinstance(codex, (int, float)) and 0 <= codex < 99:
                 return 'codex', model
-        if resume and tool == 'codex':
             return None
         usage = self.claude_reader()
         if usage:
@@ -312,6 +332,8 @@ class Runner:
 
     def apply_final(self, item, job):
         final = job.get('final')
+        cut_message = (usage_limit_message(job.get('tail', ''))
+                       if job['tool'] == 'codex' and not final else None)
         if job['tool'] == 'codex' and job.get('pr'):
             item['pr'] = job['pr']
         if job['tool'] == 'codex' and final and item['pr'] is None:
@@ -321,7 +343,28 @@ class Runner:
                 named = re.findall(r'(?:/pull/|\bPR\s+#)(\d+)', final['body'], re.I)
                 if named:
                     item['pr'] = int(named[-1])
-        if not final:
+        if cut_message:
+            reset = codex_primary()
+            reset_at = reset.get('resets_at') if reset else None
+            if reset_at is None:
+                match = re.search(r'try again at (\d{1,2}:\d{2}\s*[AP]M)', cut_message, re.I)
+                if match:
+                    try:
+                        target = datetime.strptime(match[1].upper(), '%I:%M %p').time()
+                        retry = self.instant.replace(hour=target.hour, minute=target.minute,
+                                                      second=0, microsecond=0)
+                        if retry <= self.instant:
+                            retry += timedelta(days=1)
+                        reset_at = retry.timestamp()
+                    except ValueError:
+                        pass
+            if reset_at is None:
+                reset_at = (self.instant + timedelta(minutes=60)).timestamp()
+            reset_at = max(float(reset_at), self.instant.timestamp())
+            job['phase'], job['reset_at'] = 'usage-limit-wait', reset_at
+            resumes = datetime.fromtimestamp(reset_at, self.instant.tzinfo).strftime('%H:%M')
+            self.log(item, f"cut by Codex's usage limit; resumes after {resumes}", True)
+        elif not final:
             tail = job.get('tail', '')
             first, _, rest = tail.partition('\n')
             summary = first if re.match(r'(?:codex|claude) exec exited \d+: ', first) else 'the run ended without a final message'
@@ -375,6 +418,10 @@ class Runner:
     def deliver(self, item):
         job = self.jobs.get(item['id'])
         attention = item['attention']
+        if (job and job['phase'] == 'usage-limit-wait' and not attention
+                and self.instant.timestamp() >= job['reset_at']):
+            self.launch(item, 'Your turn was cut by the usage limit. Your uncommitted work is in your working tree. Continue the slice.', resume=True)
+            return
         if attention and attention['answer'] is not None:
             if not job or not item['session'] or not item['session']['id']:
                 self.defer(item, 'deferred: session unavailable')
@@ -458,7 +505,7 @@ class Runner:
                             if phase_before == 'node-step':
                                 self.attention(item, 'node-step', job['request']['node_steps'])
                         marker = 'collected turn: ' + Path(job['run']).name
-                        if (job['phase'] in ('ended', 'collected', 'pr')
+                        if (job['phase'] in ('ended', 'collected', 'pr', 'usage-limit-wait')
                                 and not any(e['event'] == marker for e in item['log'])):
                             item['session'] = {'tool': job['tool'], 'id': job['session'], 'folder': job['repo']}
                             item['state'] = 'issued'

@@ -145,29 +145,29 @@ def test_dependency_accepted(setup):
     assert len(p.started) == 1
 
 
-@pytest.mark.parametrize('used,age,claude_used,model,expected', [
-    (99.9, 0, 0, 'gpt-sol', 'codex'),
-    (100, 0, 89.9, 'gpt-sol', 'opus'),
-    (100, 0, 0, 'other', 'sonnet'),
-    (100, 3599, 0, 'gpt-sol', 'opus'),
-    (100, 3600, 0, 'gpt-sol', None),
-    (100, 0, 90, 'gpt-sol', None),
-    (None, 0, 1, 'gpt-sol', 'opus'),
-    (100, -1, 0, 'gpt-sol', None),
-])
-def test_capacity(setup, used, age, claude_used, model, expected):
+@pytest.mark.parametrize('used', [0, 98.9, None, 99, 99.9, 100])
+def test_codex_capacity_never_falls_back_to_claude(setup, used):
     r, p, _ = setup
-    edit(r, lambda s: s['executor'].update(model=model))
     r.codex_reader = lambda: used
-    r.claude_reader = lambda: {'at': NOW.timestamp() - age, 'rate_limits': {'five_hour': {'used_percentage': claude_used}}}
+    r.claude_reader = lambda: {'at': NOW.timestamp(), 'rate_limits': {'five_hour': {'used_percentage': 1}}}
     r.run()
-    if expected:
+    if isinstance(used, (int, float)) and 0 <= used < 99:
         assert len(p.started) == 1
-        assert p.started[0]['model'] == (model if expected == 'codex' else expected)
-        assert p.started[0]['prompt'] == 'The exact prompt.\n' + (CLAUDE_PARAGRAPH if expected != 'codex' else '')
+        assert p.started[0]['tool'] == 'codex'
+        assert p.started[0]['model'] == 'example-model'
     else:
         assert not p.started
         assert item(r)['state'] == 'ready'
+
+
+def test_explicit_claude_slice_starts_on_claude(setup):
+    r, p, _ = setup
+    edit(r, lambda s: s['executor'].update(tool='claude', model='sonnet'))
+    r.claude_reader = lambda: {'at': NOW.timestamp(), 'rate_limits': {'five_hour': {'used_percentage': 1}}}
+    r.run()
+    assert p.started[0]['tool'] == 'claude'
+    assert p.started[0]['model'] == 'sonnet'
+    assert p.started[0]['prompt'].startswith('The exact prompt.\n' + CLAUDE_PARAGRAPH)
 
 
 def test_missing_capacity_defers(setup):
@@ -316,6 +316,7 @@ def test_answer_resumes_and_capacity_defers(setup, kind):
 
 def claude_start(r):
     r.codex_reader = lambda: 100
+    edit(r, lambda s: s['executor'].update(tool='claude', model='sonnet'))
     r.claude_reader = lambda: {'at': NOW.timestamp(), 'rate_limits': {'five_hour': {'used_percentage': 1}}}
     r.run()
 
@@ -831,7 +832,7 @@ def test_brief_frontmatter_and_option_like_prompt_are_passed_after_separator(set
     r, p, _ = setup
     (r.path.parent / 'briefs/W1.md').write_text('---\nstatus: ready\n---\n- begin with an option-like line\n')
     if tool == 'claude':
-        r.codex_reader = lambda: 100
+        edit(r, lambda s: s['executor'].update(tool='claude', model='sonnet'))
         r.claude_reader = lambda: {'at': NOW.timestamp(), 'rate_limits': {'five_hour': {'used_percentage': 1}}}
     r.run()
     assert p.started[0]['prompt'] == '- begin with an option-like line\n' + (CLAUDE_PARAGRAPH if tool == 'claude' else '')
@@ -852,6 +853,7 @@ def test_null_claude_percentage_is_unknown(setup):
 def test_expired_claude_window_is_free_even_with_old_usage_file(setup):
     r, p, _ = setup
     r.codex_reader = lambda: 100
+    edit(r, lambda s: s['executor'].update(tool='claude', model='sonnet'))
     r.claude_reader = lambda: {'at': NOW.timestamp() - 7200, 'rate_limits': {'five_hour': {
         'used_percentage': 100, 'resets_at': NOW.timestamp() - 1}}}
     r.run()
@@ -964,12 +966,59 @@ def test_uninstall_cli_without_state(monkeypatch):
     uninstall.assert_called_once()
 
 
-def test_fallback_keeps_configured_model_for_future_starts(setup):
+def test_explicit_claude_keeps_configured_tool_and_model(setup):
     r, p, _ = setup
+    edit(r, lambda s: s['executor'].update(tool='claude', model='sonnet'))
     original = item(r)['executor']
-    claude_start(r)
+    r.claude_reader = lambda: {'at': NOW.timestamp(), 'rate_limits': {'five_hour': {'used_percentage': 1}}}
+    r.run()
     assert item(r)['executor'] == original
     assert item(r)['session']['tool'] == 'claude'
+
+
+def test_codex_usage_limit_waits_then_resumes_once(setup, monkeypatch):
+    r, p, _ = setup
+    r.run()
+    run = p.started[0]['run']
+    retry_at = NOW.timestamp() + 60
+    monkeypatch.setattr('cplane.runner.codex_primary', lambda: {'resets_at': retry_at})
+    failure = {'type': 'turn.failed', 'error': {'message': 'You’ve hit your usage limit. Try again at 10:01 AM.'}}
+    p.results[run] = (True, 'session-1', None, json.dumps(failure))
+
+    r.run()
+
+    assert item(r)['state'] == 'issued'
+    assert item(r)['attention'] is None
+    assert len(p.started) == 1
+    assert len(r.notices) == 1
+    assert "cut by Codex's usage limit; resumes after 10:01" in r.notices[0]['text']
+    assert r.jobs[item(r)['id']]['phase'] == 'usage-limit-wait'
+
+    r.clock = lambda: NOW + timedelta(seconds=59)
+    r.codex_reader = lambda: 99
+    r.run()
+    assert len(p.started) == 1
+
+    r.clock = lambda: NOW + timedelta(seconds=60)
+    r.codex_reader = lambda: 0
+    r.run()
+    assert len(p.started) == 2
+    assert p.started[-1]['resume'] == 'session-1'
+    assert p.started[-1]['prompt'] == (
+        'Your turn was cut by the usage limit. Your uncommitted work is in your working tree. '
+        'Continue the slice.')
+    r.run()
+    assert len(p.started) == 2
+
+
+def test_non_limit_codex_failure_still_escalates(setup):
+    r, p, _ = setup
+    r.run()
+    job = p.started[0]
+    p.results[job['run']] = (True, 'session-1', None, 'codex exec exited 1: unexpected argument')
+    r.run()
+    assert item(r)['attention']['kind'] == 'escalation'
+    assert all('cut by Codex' not in notice['text'] for notice in r.notices)
 
 
 def test_claude_session_resumes_even_when_codex_capacity_returns(setup):
