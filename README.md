@@ -259,9 +259,12 @@ tasks longer than 4000 characters are refused.
 A slice starts when ready, unpaused, at or after its slot, with every dependency
 accepted. Accepted slices are skipped with a log entry on each pass; the runner
 does not start, resume, deliver to, merge for, or collect into them, including when
-saved jobs or attention remain. Codex uses the slice's model when its latest five-hour usage is below
-100%. Otherwise Claude uses opus for a Sol model and sonnet for other models,
-provided its usage file is less than an hour old and below 90% for five hours.
+saved jobs or attention remain. A slice runs only on its configured executor.
+Codex needs known five-hour usage below 99%; when its window is full, Codex slices
+are deferred until capacity returns and are never moved to Claude. A Codex turn cut
+by its usage limit waits in its run record and resumes the same session after the
+reset; other failed turns still raise escalation. Claude slices use their configured
+model and require a usage file less than an hour old and below 90% for five hours.
 Missing usage is unavailable capacity. The next pass retries deferred work.
 Resumes retain the session's tool and model and wait for that tool's capacity;
 sessions cannot transfer between providers. At most two turns run concurrently,
