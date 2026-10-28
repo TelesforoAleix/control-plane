@@ -113,14 +113,19 @@ def test_wake_plist_command(capsys):
 
 def run_wake(tmp_path, now, today, tomorrow, existing=''):
     folder = tmp_path / 'wakebin'
-    folder.mkdir()
+    folder.mkdir(exist_ok=True)
     calls = tmp_path / 'calls'
-    fake(folder, 'pmset', f'if [ "$1" = -g ]; then printf %s "{existing}"; else echo "$@" >> {calls}; fi\n')
+    calls.write_text('')
+    sched = tmp_path / 'sched'
+    sched.write_text(existing)
+    fake(folder, 'pmset', f'if [ "$1" = -g ]; then cat {sched}; else echo "$@" >> {calls}; fi\n')
     fake(folder, 'date', f'''case "$*" in
   +%y%m%d%H%M) echo {now};;
   "-v+0d +%y%m%d") echo {today[0]};;
+  "-v+0d +%m/%d/%Y") echo {today[1].replace("/26", "/2026")};;
   "-v+0d +%m/%d/%y") echo {today[1]};;
   "-v+1d +%y%m%d") echo {tomorrow[0]};;
+  "-v+1d +%m/%d/%Y") echo {tomorrow[1].replace("/26", "/2026")};;
   "-v+1d +%m/%d/%y") echo {tomorrow[1]};;
   *) exit 1;;
 esac
@@ -140,8 +145,16 @@ def test_wake_schedules_remaining_and_tomorrow(tmp_path):
 
 
 def test_wake_skips_existing_and_past(tmp_path):
-    existing = ' wake at 10/28/26 15:59:00 by pmset\\n wake at 10/29/26 05:59:00 by pmset'
+    existing = ' wake at 10/28/2026 15:59:00 by pmset\\n wake at 10/29/2026 05:59:00 by pmset'
     calls = run_wake(tmp_path, '2610280005', *DAYS, existing=existing)
     wanted = ['10/28/26 05:59:00', '10/28/26 10:59:00', '10/28/26 20:59:00',
               '10/29/26 10:59:00', '10/29/26 15:59:00', '10/29/26 20:59:00']
     assert calls == ['schedule wake ' + w for w in wanted]
+
+
+def test_wake_second_run_skips_four_digit_year_schedule(tmp_path):
+    first = run_wake(tmp_path, '2610280005', *DAYS)
+    scheduled = '\n'.join(' wake at ' + line.removeprefix('schedule wake ').replace('/26 ', '/2026 ') + ' by pmset'
+                            for line in first)
+    second = run_wake(tmp_path, '2610280005', *DAYS, existing=scheduled)
+    assert second == []

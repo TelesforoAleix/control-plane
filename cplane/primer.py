@@ -155,12 +155,14 @@ sched=$(pmset -g sched)
 now=$(date +%y%m%d%H%M)
 for d in 0 1; do
   key=$(date -v+${d}d +%y%m%d)
-  day=$(date -v+${d}d +%m/%d/%y)
+  day=$(date -v+${d}d +%m/%d/%Y)
+  schedule_day=$(date -v+${d}d +%m/%d/%y)
   for t in ''' + ' '.join(WAKE_TIMES) + '''; do
     when="$day $t:00"
+    schedule_when="$schedule_day $t:00"
     [ "$key${t%:*}${t#*:}" -gt "$now" ] || continue
     case "$sched" in *"$when"*) continue;; esac
-    pmset schedule wake "$when"
+    pmset schedule wake "$schedule_when"
   done
 done
 '''

@@ -48,6 +48,7 @@ def command(job):
     folder = Path(job['run'])
     if job['tool'] == 'codex':
         args = ['codex', 'exec', '-m', job['model'], '-c', 'sandbox_mode="workspace-write"',
+                '-c', f'model_reasoning_effort="{job.get("effort", "low" if "luna" in job["model"].lower() else "medium")}"',
                 '-c', 'sandbox_workspace_write.network_access=true',
                 '-c', 'sandbox_workspace_write.writable_roots=' + json.dumps(
                     [str(Path(job['repo']) / '.git'), *cache_roots()]),

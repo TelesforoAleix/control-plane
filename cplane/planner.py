@@ -27,7 +27,7 @@ def change_for(args):
     def change(item, data, at):
         if args.command in ("add", "edit"):
             values = {key: getattr(args, key) for key in FIELDS if hasattr(args, key)}
-            executor = {key: getattr(args, key) for key in ("tool", "model") if hasattr(args, key)}
+            executor = {key: getattr(args, key) for key in ("tool", "model", "effort") if hasattr(args, key)}
             if hasattr(args, "new_id"):
                 values["id"] = args.new_id
             if (args.command == "edit" and item["state"] in ("issued", "awaiting handover")
