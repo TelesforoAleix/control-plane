@@ -286,6 +286,7 @@ class Runner:
             self.defer(item, 'deferred: capacity unavailable')
             return False
         tool, model = choice
+        effort = item['executor'].get('effort', 'low' if 'luna' in model.lower() else 'medium')
         folder = self.repo(item)
         if not folder.is_dir():
             raise state.StateError(f'missing repository: {folder}')
@@ -294,7 +295,7 @@ class Runner:
         if tool == 'claude' and not resume:
             prompt += CLAUDE_PARAGRAPH
         job = {'id': item['id'], 'repo': str(folder), 'run': str(run), 'tool': tool,
-               'model': model, 'prompt': prompt, 'started_ns': time.time_ns(),
+               'model': model, 'effort': effort, 'prompt': prompt, 'started_ns': time.time_ns(),
                'session': item['session']['id'] if resume else '',
                'resume': item['session']['id'] if resume else None, 'phase': 'running'}
         # Persist intent before starting; an ambiguous handoff reserves a slot.

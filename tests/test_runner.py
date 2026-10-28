@@ -543,11 +543,37 @@ def test_codex_exact_arguments_and_missing_cache_skipped(tmp_path, monkeypatch):
            'prompt': '-literal prompt', 'resume': 'session'}
     assert command(job) == [
         'codex', 'exec', '-m', 'model', '-c', 'sandbox_mode="workspace-write"',
+        '-c', 'model_reasoning_effort="medium"',
         '-c', 'sandbox_workspace_write.network_access=true', '-c',
         'sandbox_workspace_write.writable_roots=' + json.dumps(
             ['/tmp/repo/.git', str((home / '.cache/uv').resolve())]),
         '--output-schema', str(run / 'schema.json'), '--json', '-o', str(run / 'last.json'),
         'resume', 'session', '--', '-literal prompt']
+
+
+@pytest.mark.parametrize('model,effort', [('gpt-6-luna', 'low'), ('gpt-6.1-terra', 'medium')])
+def test_codex_effort_defaults_and_explicit_levels(tmp_path, model, effort):
+    job = {'tool': 'codex', 'run': str(tmp_path), 'repo': '/tmp/repo', 'model': model, 'prompt': 'brief'}
+    args = command(job)
+    assert args[args.index('model_reasoning_effort="' + effort + '"') - 1] == '-c'
+    job['effort'] = 'xhigh'
+    assert 'model_reasoning_effort="xhigh"' in command(job)
+
+
+def test_runner_effort_applies_to_resume_and_old_state(setup):
+    r, p, _ = setup
+    edit(r, lambda s: s['executor'].pop('effort', None))
+    r.run()
+    assert p.started[-1]['effort'] == 'medium'
+    assert 'model_reasoning_effort="medium"' in command(p.started[-1])
+    p.finish('question')
+    r.run()
+    edit(r, lambda s: s['attention'].update(answer='continue'))
+    edit(r, lambda s: s['executor'].update(effort='xhigh'))
+    r.run()
+    assert p.started[-1]['resume'] == 'session-1'
+    assert p.started[-1]['effort'] == 'xhigh'
+    assert 'model_reasoning_effort="xhigh"' in command(p.started[-1])
 
 
 @pytest.mark.parametrize('tool', ['codex', 'claude'])

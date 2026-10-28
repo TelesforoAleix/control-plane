@@ -57,15 +57,21 @@ this repository contains only the schema and synthetic test fixtures.
 | `primer-wake-plist` | Print the root wake-schedule LaunchDaemon plist; never installs it. |
 
 `add` and `edit` accept `--repo`, `--feature`, `--title`, `--brief`,
-`--tool codex|claude`, `--model`, `--stop-before-merge` (or
+`--tool codex|claude`, `--model`, `--effort low|medium|high|xhigh|max|ultra`,
+`--stop-before-merge` (or
 `--no-stop-before-merge`), and `--depends-on <id> …`. Dependencies replace the
 list; `--depends-on` with no IDs clears it, and repeated occurrences extend the
 replacement list. `edit` also accepts `--id` to change the ID; references in other
 slices are left as recorded. IDs remain unique. While issued or awaiting handover,
 only the title and dependencies can be edited.
 
-New slices default to executor `codex` / `gpt-6.1-sol`, no brief, no dependencies,
+New slices default to executor `codex` / `gpt-6.1-sol`, no effort override, no brief,
+no dependencies,
 `stop_before_merge` and `paused` false, and null slot, session, PR, and attention.
+Codex effort defaults to `low` for models containing `luna` and `medium` for other
+models. `--effort` overrides that default for starts and resumes; Codex's supported
+levels are `low`, `medium`, `high`, `xhigh`, and `max`, with `ultra` also available
+for Sol and Terra models.
 The command creates the first log entry. Brief paths are stored without reading
 the file. A brief must be set before moving to ready.
 
@@ -341,6 +347,9 @@ directory with stdin closed. One failing does not stop the other. It holds
 (current Python and checkout, captured PATH, 06:00, 11:00, 16:00 and 21:00, logs in
 `~/Library/Logs/cplane/`). `uninstall-primer` removes only that job. Neither touches
 the runner's agent.
+
+After the wake schedule date check fix, reinstall the root wake daemon by running
+the removal commands below, then the install commands above.
 
 `~/Library/Logs/cplane/primer.log` gets one line per tool (`time tool ok` or
 `time tool error exit N|timeout`; never response text) and one line for the sleep

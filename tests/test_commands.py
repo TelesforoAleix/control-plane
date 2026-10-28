@@ -47,6 +47,18 @@ def test_start(make_state):
     assert json.loads(path.with_name(path.name + ".outbox.jsonl").read_text())["event"] == "start"
 
 
+def test_effort_add_edit_and_show(make_state, capsys):
+    path = make_state([])
+    assert main(["--state", str(path), "add", "--id", "voice/W2", "--repo", "example/repo",
+                 "--feature", "example", "--title", "Second", "--effort", "xhigh"]) == 0
+    item = load(path)["slices"][0]
+    assert item["executor"]["effort"] == "xhigh"
+    assert main(["--state", str(path), "edit", "voice/W2", "--effort", "low"]) == 0
+    assert load(path)["slices"][0]["executor"]["effort"] == "low"
+    assert main(["--state", str(path), "show", "voice/W2", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["executor"]["effort"] == "low"
+
+
 @pytest.mark.parametrize("command,kind", [("approve", "merge"), ("answer", "question"), ("answer", "escalation")])
 def test_attention_success(make_state, slice_data, command, kind):
     slice_data["attention"] = attention(kind)

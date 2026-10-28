@@ -27,7 +27,8 @@
         "brief": {"type": ["string", "null"]},
         "executor": {
           "type": "object", "additionalProperties": false, "required": ["tool", "model"],
-          "properties": {"tool": {"$ref": "#/$defs/tool"}, "model": {"type": "string"}}
+          "properties": {"tool": {"$ref": "#/$defs/tool"}, "model": {"type": "string"},
+            "effort": {"enum": ["low", "medium", "high", "xhigh", "max", "ultra"]}}
         },
         "stop_before_merge": {"type": "boolean"},
         "depends_on": {"type": "array", "items": {"$ref": "#/$defs/id"}, "uniqueItems": true},
