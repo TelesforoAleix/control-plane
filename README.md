@@ -52,6 +52,9 @@ this repository contains only the schema and synthetic test fixtures.
 | `approve <id>` / `answer <id> <text>` | Approve merge attention or answer a question/escalation. |
 | `run` | Make one runner pass. |
 | `install-agent` / `uninstall-agent` | Install or remove the launchd runner. |
+| `prime` | Send one tiny request to Claude and Codex to start their usage windows. |
+| `install-primer` / `uninstall-primer` | Install or remove the launchd job that runs `prime`. |
+| `primer-wake-plist` | Print the root wake-schedule LaunchDaemon plist; never installs it. |
 
 `add` and `edit` accept `--repo`, `--feature`, `--title`, `--brief`,
 `--tool codex|claude`, `--model`, `--stop-before-merge` (or
@@ -325,3 +328,53 @@ when state saving fails; PR lookup and merge lookup recover completed GitHub ste
 A crash in the launch/supervisor handoff may need inspection of the run directory;
 the runner conservatively reserves capacity rather than launching a duplicate.
 Sync failures retain the local state commit. Resolve them before another pass.
+
+## Window primer
+
+The five-hour usage windows of Codex and Claude start at first use. `cplane prime`
+starts them on a schedule instead: it sends `Reply with: ok` to Claude (`haiku`),
+then Codex (`gpt-6-luna`), each with a 120-second timeout, from an empty temporary
+directory with stdin closed. One failing does not stop the other. It holds
+`caffeinate -s -i` while it works. It needs no state file.
+
+`install-primer` writes and bootstraps `~/Library/LaunchAgents/com.cplane.primer.plist`
+(current Python and checkout, captured PATH, 06:00, 11:00, 16:00 and 21:00, logs in
+`~/Library/Logs/cplane/`). `uninstall-primer` removes only that job. Neither touches
+the runner's agent.
+
+`~/Library/Logs/cplane/primer.log` gets one line per tool (`time tool ok` or
+`time tool error exit N|timeout`; never response text) and one line for the sleep
+decision. After both requests `prime` runs `pmset sleepnow` only if the last wake was
+under 10 minutes ago, was an RTC or scheduled wake, and had no user input since;
+otherwise it leaves the Mac as it is.
+
+The Mac must wake a minute before each ping. Once, as a backstop (undo with
+`sudo pmset repeat cancel`):
+
+```sh
+sudo pmset repeat wake MTWRFSU 05:59:00
+```
+
+The other wakes come from a root LaunchDaemon, `com.cplane.primer-wake`. Its plist
+is self-contained (an inline script; root runs no file from the checkout). At load
+and at 00:05 it schedules today's remaining and tomorrow's wakes (05:59, 10:59,
+15:59, 20:59) with `pmset schedule wake`, skipping any already listed in
+`pmset -g sched` or in the past. Install it once:
+
+```sh
+D=/Library/LaunchDaemons/com.cplane.primer-wake.plist
+T=$(mktemp)
+uv run cplane primer-wake-plist > "$T"
+sudo cp "$T" "$D"
+sudo chown root:wheel "$D"
+sudo chmod 644 "$D"
+sudo launchctl bootstrap system "$D"
+```
+
+Remove it (scheduled one-shot wakes stay until they pass):
+
+```sh
+D=/Library/LaunchDaemons/com.cplane.primer-wake.plist
+sudo launchctl bootout system "$D"
+sudo rm "$D"
+```
