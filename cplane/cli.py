@@ -155,12 +155,27 @@ def parser():
     commands.add_parser("compact", parents=[common], help="bound oversized runner text in state")
     for command in ("run", "install-agent", "uninstall-agent"):
         commands.add_parser(command, parents=[common])
+    commands.add_parser("prime", parents=[common], help="send one minimal request to Claude and Codex to start their usage windows")
+    commands.add_parser("install-primer", parents=[common], help="install the launchd job that runs prime at 06:00, 11:00, 16:00 and 21:00")
+    commands.add_parser("uninstall-primer", parents=[common], help="remove the primer launchd job")
+    commands.add_parser("primer-wake-plist", parents=[common], help="print the root wake-schedule LaunchDaemon plist; never installs it")
     return root
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
+        if args.command in ("prime", "install-primer", "uninstall-primer", "primer-wake-plist"):
+            from . import primer
+            if args.command == "prime":
+                return 0 if primer.prime() else 1
+            if args.command == "install-primer":
+                primer.install()
+            elif args.command == "uninstall-primer":
+                primer.uninstall()
+            else:
+                print(primer.wake_plist(), end="")
+            return 0
         if args.command == "uninstall-agent":
             from .agent import uninstall
             uninstall()
