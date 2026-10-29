@@ -843,6 +843,32 @@ def test_codex_usage_latest_nonnull_report(tmp_path, monkeypatch):
     assert codex_usage(folder) == 34
 
 
+def test_codex_usage_falls_back_to_older_session_with_report(tmp_path):
+    from cplane.runner import codex_usage
+    folder = tmp_path / 'sessions'
+    folder.mkdir()
+    older = folder / 'older.jsonl'
+    newest = folder / 'newest.jsonl'
+    older.write_text('{"payload":{"rate_limits":{"primary":{"used_percent":40}}}}')
+    newest.write_text('{"payload":{"rate_limits":null}}')
+    os.utime(older, (1, 1))
+    os.utime(newest, (2, 2))
+    assert codex_usage(folder) == 40
+
+
+def test_codex_usage_prefers_newest_session_report(tmp_path):
+    from cplane.runner import codex_usage
+    folder = tmp_path / 'sessions'
+    folder.mkdir()
+    older = folder / 'older.jsonl'
+    newest = folder / 'newest.jsonl'
+    older.write_text('{"payload":{"rate_limits":{"primary":{"used_percent":40}}}}')
+    newest.write_text('{"payload":{"rate_limits":{"primary":{"used_percent":17}}}}')
+    os.utime(older, (1, 1))
+    os.utime(newest, (2, 2))
+    assert codex_usage(folder) == 17
+
+
 def test_codex_usage_expired_window_is_free(tmp_path, monkeypatch):
     from cplane.runner import codex_usage
     folder = tmp_path / 'sessions'

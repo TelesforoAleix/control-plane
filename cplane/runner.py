@@ -33,10 +33,10 @@ def codex_usage(folder=None):
 
 def codex_primary(folder=None):
     paths = Path(folder or Path.home() / '.codex/sessions').rglob('*.jsonl')
-    newest = max(paths, key=lambda p: p.stat().st_mtime_ns, default=None)
-    if newest:
+    newest_first = sorted(paths, key=lambda p: p.stat().st_mtime_ns, reverse=True)
+    for session in newest_first:
         # Walk backwards: the last non-null capacity report is the current one.
-        for line in reversed(newest.read_text(errors='replace').splitlines()):
+        for line in reversed(session.read_text(errors='replace').splitlines()):
             try:
                 limits = json.loads(line).get('payload', {}).get('rate_limits')
                 if limits and limits.get('primary'):
