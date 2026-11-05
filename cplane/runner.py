@@ -23,15 +23,20 @@ WORKTREE_MAX_AGE = 7 * 24 * 60 * 60
 
 
 def codex_usage(folder=None):
-    primary = codex_primary(folder)
-    if primary:
-        if primary.get('resets_at') is not None and primary['resets_at'] <= time.time():
-            return 0
-        return primary.get('used_percent')
-    return None
+    windows = codex_limits(folder)
+    if not windows:
+        return None
+    used = []
+    for window in windows:
+        if window.get('resets_at') is not None and window['resets_at'] <= time.time():
+            used.append(0)
+        elif isinstance(window.get('used_percent'), (int, float)):
+            used.append(window['used_percent'])
+    return max(used) if used else None
 
 
-def codex_primary(folder=None):
+def codex_limits(folder=None):
+    """The non-null windows (5-hour primary, weekly secondary) of the newest report."""
     paths = Path(folder or Path.home() / '.codex/sessions').rglob('*.jsonl')
     newest_first = sorted(paths, key=lambda p: p.stat().st_mtime_ns, reverse=True)
     for session in newest_first:
@@ -39,8 +44,10 @@ def codex_primary(folder=None):
         for line in reversed(session.read_text(errors='replace').splitlines()):
             try:
                 limits = json.loads(line).get('payload', {}).get('rate_limits')
-                if limits and limits.get('primary'):
-                    return limits['primary']
+                windows = [limits[k] for k in ('primary', 'secondary')
+                           if isinstance(limits.get(k), dict)] if limits else []
+                if windows:
+                    return windows
             except (ValueError, KeyError, TypeError, AttributeError):
                 continue
     return None
@@ -233,6 +240,9 @@ class Runner:
         else:
             tool = item['executor']['tool']
         if tool == 'codex':
+            if any(j['phase'] == 'usage-limit-wait' and j['reset_at'] > self.instant.timestamp()
+                   for j in self.jobs.values()):
+                return None
             codex = self.codex_reader()
             if isinstance(codex, (int, float)) and 0 <= codex < 99:
                 return 'codex', model
@@ -294,11 +304,14 @@ class Runner:
         run.mkdir(parents=True, mode=0o700)
         if tool == 'claude' and not resume:
             prompt += CLAUDE_PARAGRAPH
+        previous = self.jobs.get(item['id'])
         job = {'id': item['id'], 'repo': str(folder), 'run': str(run), 'tool': tool,
                'model': model, 'effort': effort, 'prompt': prompt, 'started_ns': time.time_ns(),
                'session': item['session']['id'] if resume else '',
                'resume': item['session']['id'] if resume else None, 'phase': 'running'}
         # Persist intent before starting; an ambiguous handoff reserves a slot.
+        if resume and previous and previous.get('noticed') is not None:
+            job['noticed'] = previous['noticed']
         self.save_job(job)
         try:
             job['pid'] = self.processes.start(job)
@@ -331,6 +344,28 @@ class Runner:
         self.save_job(job)
         self.apply_final(item, job)
 
+    def limit_reset(self, message):
+        """The reset time named in a usage-limit message, if it is still ahead."""
+        match = re.search(r'try again at (?:([A-Za-z]{3}) (\d{1,2})(?:st|nd|rd|th)?, (\d{4}) )?'
+                          r'(\d{1,2}:\d{2}\s*[AP]M)', message, re.I)
+        if not match:
+            return None
+        try:
+            clock = datetime.strptime(match[4].upper().replace(' ', ''), '%I:%M%p').time()
+            if match[1]:
+                day = datetime.strptime(f'{match[1].title()} {match[2]} {match[3]}', '%b %d %Y')
+                retry = self.instant.replace(year=day.year, month=day.month, day=day.day,
+                                             hour=clock.hour, minute=clock.minute,
+                                             second=0, microsecond=0)
+            else:
+                retry = self.instant.replace(hour=clock.hour, minute=clock.minute,
+                                             second=0, microsecond=0)
+                if retry <= self.instant:
+                    retry += timedelta(days=1)
+        except ValueError:
+            return None
+        return retry.timestamp() if retry > self.instant else None
+
     def apply_final(self, item, job):
         final = job.get('final')
         cut_message = (usage_limit_message(job.get('tail', ''))
@@ -345,26 +380,28 @@ class Runner:
                 if named:
                     item['pr'] = int(named[-1])
         if cut_message:
-            reset = codex_primary()
-            reset_at = reset.get('resets_at') if reset else None
+            now_ts = self.instant.timestamp()
+            reset_at, limit = self.limit_reset(cut_message), None
             if reset_at is None:
-                match = re.search(r'try again at (\d{1,2}:\d{2}\s*[AP]M)', cut_message, re.I)
-                if match:
-                    try:
-                        target = datetime.strptime(match[1].upper(), '%I:%M %p').time()
-                        retry = self.instant.replace(hour=target.hour, minute=target.minute,
-                                                      second=0, microsecond=0)
-                        if retry <= self.instant:
-                            retry += timedelta(days=1)
-                        reset_at = retry.timestamp()
-                    except ValueError:
-                        pass
+                windows = [w for w in (codex_limits() or [])
+                           if isinstance(w.get('used_percent'), (int, float)) and w['used_percent'] >= 99
+                           and isinstance(w.get('resets_at'), (int, float)) and w['resets_at'] > now_ts]
+                if windows:
+                    reset_at = float(max(w['resets_at'] for w in windows))
             if reset_at is None:
-                reset_at = (self.instant + timedelta(minutes=60)).timestamp()
-            reset_at = max(float(reset_at), self.instant.timestamp())
+                reset_at, limit = (self.instant + timedelta(minutes=60)).timestamp(), 'fixed'
+            else:
+                limit = reset_at
             job['phase'], job['reset_at'] = 'usage-limit-wait', reset_at
-            resumes = datetime.fromtimestamp(reset_at, self.instant.tzinfo).strftime('%H:%M')
-            self.log(item, f"cut by Codex's usage limit; resumes after {resumes}", True)
+            resume_time = datetime.fromtimestamp(reset_at, self.instant.tzinfo)
+            resumes = resume_time.strftime('%H:%M' if resume_time.date() == self.instant.date() else '%b %d %H:%M')
+            noticed = job.get('noticed')
+            same = noticed == limit == 'fixed' or (
+                isinstance(noticed, (int, float)) and isinstance(limit, (int, float))
+                and abs(noticed - limit) < 60)  # a message names the minute, a report the second
+            if not same:
+                job['noticed'] = limit
+            self.log(item, f"cut by Codex's usage limit; resumes after {resumes}", not same)
         elif not final:
             tail = job.get('tail', '')
             first, _, rest = tail.partition('\n')
@@ -420,6 +457,7 @@ class Runner:
         job = self.jobs.get(item['id'])
         attention = item['attention']
         if (job and job['phase'] == 'usage-limit-wait' and not attention
+                and not item['paused']
                 and self.instant.timestamp() >= job['reset_at']):
             self.launch(item, 'Your turn was cut by the usage limit. Your uncommitted work is in your working tree. Continue the slice.', resume=True)
             return
