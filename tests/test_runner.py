@@ -879,6 +879,170 @@ def test_codex_usage_expired_window_is_free(tmp_path, monkeypatch):
     assert codex_usage(folder) == 0
 
 
+def report(folder, primary, secondary):
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / 'session.jsonl').write_text(json.dumps(
+        {'payload': {'rate_limits': {'primary': primary, 'secondary': secondary}}}))
+
+
+def test_codex_usage_reads_both_windows(tmp_path, monkeypatch):
+    from cplane.runner import codex_usage
+    monkeypatch.setattr('cplane.runner.time.time', lambda: NOW.timestamp())
+    ahead = NOW.timestamp() + 1000
+    report(tmp_path, {'used_percent': 37.0, 'resets_at': ahead}, {'used_percent': 100.0, 'resets_at': ahead})
+    assert codex_usage(tmp_path) == 100.0
+    report(tmp_path, {'used_percent': 37.0, 'resets_at': ahead},
+           {'used_percent': 100.0, 'resets_at': NOW.timestamp() - 1})
+    assert codex_usage(tmp_path) == 37.0
+    report(tmp_path, None, None)
+    assert codex_usage(tmp_path) is None
+
+
+WEEKLY = ('You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit '
+          'https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 6th, 2026 10:57 AM.')
+FIVE_HOUR = WEEKLY.split(' try again')[0] + ' try again at 2:56 PM.'
+NO_TIME = 'You’ve hit your usage limit. Upgrade to Pro.'
+
+
+def cut(r, p, message, limits=None, monkeypatch=None):
+    monkeypatch.setattr('cplane.runner.codex_limits', lambda: limits)
+    failure = {'type': 'turn.failed', 'error': {'message': message}}
+    p.results[p.started[-1]['run']] = (True, 'session-1', None, json.dumps(failure))
+    r.run()
+    return r.jobs[item(r)['id']]
+
+
+def at(r, **delta):
+    r.clock = lambda: NOW + timedelta(**delta)
+    r.codex_reader = lambda: 0
+
+
+def test_weekly_message_sets_date_and_time(setup, monkeypatch):
+    r, p, _ = setup
+    r.run()
+    job = cut(r, p, WEEKLY, None, monkeypatch)
+    assert job['reset_at'] == datetime(2026, 11, 6, 10, 57, tzinfo=timezone.utc).timestamp()
+    assert 'resumes after Nov 06 10:57' in item(r)['log'][-2]['event']
+    at(r, days=1)
+    r.run()
+    assert len(p.started) == 1
+    at(r, days=21, hours=1)
+    r.run()
+    assert len(p.started) == 2
+
+
+@pytest.mark.parametrize('message, expected', [
+    (FIVE_HOUR, datetime(2026, 10, 16, 14, 56, tzinfo=timezone.utc)),
+    ('Error running remote compact task: ' + FIVE_HOUR, datetime(2026, 10, 16, 14, 56, tzinfo=timezone.utc)),
+    ('Error running remote compact task: ' + WEEKLY, datetime(2026, 11, 6, 10, 57, tzinfo=timezone.utc)),
+])
+def test_other_usage_limit_messages_parse(setup, monkeypatch, message, expected):
+    r, p, _ = setup
+    r.run()
+    assert cut(r, p, message, None, monkeypatch)['reset_at'] == expected.timestamp()
+
+
+def test_stale_reset_without_time_waits_sixty_minutes(setup, monkeypatch):
+    r, p, _ = setup
+    r.run()
+    stale = [{'used_percent': 100, 'resets_at': NOW.timestamp() - 3600}]
+    job = cut(r, p, NO_TIME, stale, monkeypatch)
+    assert job['reset_at'] == NOW.timestamp() + 3600
+    at(r, minutes=5)
+    r.run()
+    at(r, minutes=59)
+    r.run()
+    assert len(p.started) == 1
+    at(r, minutes=60)
+    r.run()
+    assert len(p.started) == 2
+
+
+def test_report_at_99_percent_names_the_reset(setup, monkeypatch):
+    r, p, _ = setup
+    r.run()
+    primary = {'used_percent': 37.0, 'resets_at': NOW.timestamp() + 600}
+    weekly = {'used_percent': 100.0, 'resets_at': NOW.timestamp() + 90000}
+    assert cut(r, p, NO_TIME, [primary, weekly], monkeypatch)['reset_at'] == weekly['resets_at']
+
+
+def test_null_limits_with_and_without_message_time(setup, monkeypatch):
+    r, p, _ = setup
+    r.run()
+    assert cut(r, p, FIVE_HOUR, None, monkeypatch)['reset_at'] == datetime(2026, 10, 16, 14, 56, tzinfo=timezone.utc).timestamp()
+    at(r, hours=5)
+    r.run()
+    assert cut(r, p, NO_TIME, None, monkeypatch)['reset_at'] == (NOW + timedelta(hours=6)).timestamp()
+
+
+def test_waiting_job_holds_new_codex_slice(setup, monkeypatch):
+    r, p, _ = setup
+    r.run()
+    cut(r, p, FIVE_HOUR, None, monkeypatch)
+    data = state.load(r.path)
+    (r.repos / 'other').mkdir()
+    new = copy.deepcopy(data['slices'][0])
+    new.update(id='example/other', repo='example/other', state='ready', attention=None, session=None)
+    data['slices'].append(new)
+    state.save(r.path, data)
+    r.codex_reader = lambda: 0
+    r.run()
+    assert len(p.started) == 1
+    at(r, hours=5)
+    r.run()
+    assert len(p.started) == 3
+
+
+def test_repeated_limit_gives_one_notice(setup, monkeypatch):
+    r, p, _ = setup
+    r.run()
+    cut(r, p, WEEKLY, None, monkeypatch)
+    assert len(r.notices) == 1
+
+    def resume_and_cut(message):
+        # The wait is cut short so the resume runs, as if the limit's reset had moved.
+        job = r.jobs[item(r)['id']]
+        job['reset_at'] = NOW.timestamp()
+        r.save_job(job)
+        at(r, minutes=1)
+        r.run()
+        cut(r, p, message, None, monkeypatch)
+        return [n for n in r.notices if 'cut by' in n['text']]
+
+    assert resume_and_cut(WEEKLY) == []
+    assert len(resume_and_cut(WEEKLY)) == 0
+    assert len(resume_and_cut(WEEKLY.replace('Nov 6th', 'Nov 13th'))) == 1
+    assert resume_and_cut(WEEKLY.replace('Nov 6th', 'Nov 13th')) == []
+    assert sum('cut by Codex' in e['event'] for e in item(r)['log']) == 5
+    assert len(p.started) == 5
+
+
+def test_repeated_fixed_wait_gives_one_notice(setup, monkeypatch):
+    r, p, _ = setup
+    r.run()
+    cut(r, p, NO_TIME, None, monkeypatch)
+    assert len(r.notices) == 1
+    at(r, hours=2)
+    r.run()
+    cut(r, p, NO_TIME, None, monkeypatch)
+    assert not any('cut by' in n['text'] for n in r.notices)
+
+
+def test_paused_waiting_slice_does_not_resume(setup, monkeypatch):
+    r, p, _ = setup
+    r.run()
+    cut(r, p, FIVE_HOUR, None, monkeypatch)
+    edit(r, lambda s: s.update(paused=True))
+    at(r, hours=6)
+    r.run()
+    assert len(p.started) == 1
+    edit(r, lambda s: s.update(paused=False))
+    r.run()
+    assert len(p.started) == 2
+    r.run()
+    assert len(p.started) == 2
+
+
 @pytest.mark.parametrize('tool', ['codex', 'claude'])
 def test_brief_frontmatter_and_option_like_prompt_are_passed_after_separator(setup, tool):
     r, p, _ = setup
@@ -1033,7 +1197,7 @@ def test_codex_usage_limit_waits_then_resumes_once(setup, monkeypatch):
     r.run()
     run = p.started[0]['run']
     retry_at = NOW.timestamp() + 60
-    monkeypatch.setattr('cplane.runner.codex_primary', lambda: {'resets_at': retry_at})
+    monkeypatch.setattr('cplane.runner.codex_limits', lambda: [{'resets_at': retry_at}])
     failure = {'type': 'turn.failed', 'error': {'message': 'You’ve hit your usage limit. Try again at 10:01 AM.'}}
     p.results[run] = (True, 'session-1', None, json.dumps(failure))
 
