@@ -4,6 +4,12 @@ import json
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolated_runs(tmp_path, monkeypatch):
+    # Keep tests away from any real local settings such as roles-command.
+    monkeypatch.setenv("CPLANE_RUNS", str(tmp_path / "isolated" / "runs"))
+
+
 @pytest.fixture
 def slice_data():
     return {

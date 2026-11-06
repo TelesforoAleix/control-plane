@@ -229,6 +229,26 @@ Brief paths resolve relative to the state file's directory. Repository checkouts
 resolve as `$CPLANE_REPOS/<repository-name>` (default `~/Code`). Existing owner
 commands, the version 1 schema, and the outbox format are unchanged.
 
+Runner details: the pull uses `--autostash`, so an uncommitted outbox line does not
+stop it. A `CANCELLED` check is not red when another check of the same name on the
+rollup succeeded (a stalled hosted runner); any other red conclusion stays red. An
+accepted slice whose process has ended no longer holds a slot or its repository; a
+live process still counts. For the Claude tool, a model of `opus` or `sonnet` is used
+as written; any other name maps to `opus` if it holds `sol`, else `sonnet`. A
+`node-step` attention can be answered with `cplane answer`, and the runner resumes
+the session with the text, as for an escalation.
+
+Role defaults: `cplane add --role <name>` (default `cutter`) takes the slice's
+executor from a table of roles when neither `--tool` nor `--model` is given. The
+local file `roles-command`, beside `orders-url` (the parent of the `runs` folder), holds
+a command line that prints one JSON object from role name to an ordered list of
+routes. It is split with `shlex` and run without a shell, with stdin closed and a
+10-second timeout. The first route of kind `cli` sets `tool` (`codex` or `claude`),
+`model` and, if present, `effort`; `--effort` always overrides. If the file is
+missing, the command fails or times out, the output is invalid or the role has no
+valid `cli` route, cplane keeps its own defaults and prints one line on stderr.
+Only `add` reads the table; the runner and existing slices do not.
+
 At the start of every pass, after pulling state and before scheduling, the runner
 collects confirmed owner orders from the node's HTTP endpoint. It handles `start`,
 `slot`, `pause`, `resume`, `answer`, `approve`, and `orchestrator`. Slice orders

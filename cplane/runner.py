@@ -118,7 +118,7 @@ class Git:
         probe = subprocess.run(['git', '-C', str(path.parent), 'rev-parse', '--show-toplevel'],
                                capture_output=True, text=True)
         if not probe.returncode:
-            state.git(Path(probe.stdout.strip()), 'pull', '--rebase')
+            state.git(Path(probe.stdout.strip()), 'pull', '--rebase', '--autostash')
 
     def commit(self, path):
         state.commit_state(path, Path(str(path) + '.outbox.jsonl'), 'run', 'pass')
@@ -168,8 +168,14 @@ class GitHub:
     def checks(self, repo, number):
         info = json.loads(self.call(repo, 'pr', 'view', str(number), '--json', 'statusCheckRollup'))
         pending = False
-        for check in info['statusCheckRollup']:
+        rollup = info['statusCheckRollup']
+        # A stalled hosted runner is cancelled on one of two runs; the other run may pass.
+        passed = {c.get('name') for c in rollup
+                  if c.get('name') and (c.get('conclusion') or c.get('state')) == 'SUCCESS'}
+        for check in rollup:
             conclusion = check.get('conclusion') or check.get('state')
+            if conclusion == 'CANCELLED' and check.get('name') in passed:
+                continue
             if conclusion in ('FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'):
                 return 'red', check.get('name') or check.get('context', 'check')
             if conclusion not in ('SUCCESS', 'NEUTRAL', 'SKIPPED'):
@@ -258,7 +264,7 @@ class Runner:
                 if expired:
                     used = 0
                 if (expired or 0 <= age < 3600) and isinstance(used, (int, float)) and 0 <= used < 90:
-                    return 'claude', model if resume else ('opus' if 'sol' in model.lower() else 'sonnet')
+                    return 'claude', model if resume or model in ('opus', 'sonnet') else ('opus' if 'sol' in model.lower() else 'sonnet')
             except (KeyError, TypeError):
                 pass
         return None
@@ -532,6 +538,12 @@ class Runner:
                     self.jobs[job['id']] = job
             for item in self.data['slices']:
                 if item['state'] == 'accepted':
+                    # An accepted slice's finished process must not hold a slot.
+                    job = self.jobs.get(item['id'])
+                    if job and job['phase'] == 'running':
+                        # In memory only: the accepted slice's files stay as they are.
+                        if self.processes.poll(job)[0]:
+                            job['phase'] = 'collected'
                     continue
                 try:
                     job = self.jobs.get(item['id'])

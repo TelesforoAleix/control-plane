@@ -14,6 +14,7 @@ from .times import LOCAL, parse_when
 from .text_bounds import ATTENTION_LIMIT, LOG_LIMIT, cut
 
 
+ANSWERABLE = ("question", "escalation", "node-step")
 COMMANDS = ("slot", "unslot", "start", "pause", "resume", "approve", "answer")
 
 
@@ -42,8 +43,8 @@ def change_for(command, argument=None):
             item["attention"]["approved"] = True
             notice = f"Approved merge for {item['id']}"
         elif command == "answer":
-            if not item["attention"] or item["attention"]["kind"] not in ("question", "escalation"):
-                raise state.StateError(f"{item['id']} has no question or escalation attention")
+            if not item["attention"] or item["attention"]["kind"] not in ANSWERABLE:
+                raise state.StateError(f"{item['id']} has no question, escalation or node-step attention")
             item["attention"]["answer"] = argument
             notice = f"Answered {item['id']}: {argument}"
         else:
@@ -58,8 +59,8 @@ def pending(data):
         attention = item["attention"]
         unresolved = attention and (
             (attention["kind"] == "merge" and not attention["approved"])
-            or (attention["kind"] in ("question", "escalation") and attention["answer"] is None)
-            or attention["kind"] in ("node-step", "owner-check")
+            or (attention["kind"] in ANSWERABLE and attention["answer"] is None)
+            or attention["kind"] == "owner-check"
         )
         if item["state"] == "accepted":
             continue
@@ -131,6 +132,8 @@ def parser():
             sub.add_argument(f"--{field}", required=command == "add" and field in ("repo", "feature", "title"), default=argparse.SUPPRESS)
         sub.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max", "ultra"), default=argparse.SUPPRESS)
         sub.add_argument("--tool", choices=("codex", "claude"), default=argparse.SUPPRESS)
+        if command == "add":
+            sub.add_argument("--role", default="cutter", help="role whose first cli route sets tool, model and effort when neither --tool nor --model is given (read from the local roles-command; default: cutter)")
         sub.add_argument("--stop-before-merge", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS)
         sub.add_argument("--depends-on", nargs="*", action="extend", default=argparse.SUPPRESS, metavar="ID")
     move = commands.add_parser("state", parents=[common], help="move a slice between planning states")
@@ -147,7 +150,7 @@ def parser():
     review = commands.add_parser("review", parents=[common], help="record a planner review of merge attention")
     review.add_argument("id")
     review.add_argument("verdict")
-    helps = {"slot": "schedule a ready slice", "unslot": "clear a slot", "start": "slot a ready slice now", "pause": "set paused", "resume": "clear paused", "approve": "approve merge attention", "answer": "answer a question or escalation"}
+    helps = {"slot": "schedule a ready slice", "unslot": "clear a slot", "start": "slot a ready slice now", "pause": "set paused", "resume": "clear paused", "approve": "approve merge attention", "answer": "answer a question, escalation or node step"}
     for command in COMMANDS:
         sub = commands.add_parser(command, parents=[common], help=helps[command])
         sub.add_argument("id")
@@ -255,7 +258,16 @@ def main(argv=None):
                 folder = str(latest[1]) if latest else '(none)'
                 print(details + f'\nrun: {folder}')
         elif args.command in ("add", "edit", "state", "attention", "review"):
-            event = None
+            event = note = None
+            if args.command == "add" and not hasattr(args, "tool") and not hasattr(args, "model"):
+                from . import roles
+                route, why = roles.lookup(args.role, roles.command_file())
+                if route is None:
+                    note = f"roles: {why}; using built-in defaults"
+                else:
+                    args.tool, args.model = route["tool"], route["model"]
+                    if "effort" in route and not hasattr(args, "effort"):
+                        args.effort = route["effort"]
             if args.command == "state":
                 event = f"state: {args.target}"
                 if args.force:
@@ -264,6 +276,8 @@ def main(argv=None):
                          planner.change_for(args), getattr(args, "commit", False),
                          create=(lambda: planner.new_slice(args.id)) if args.command == "add" else None,
                          event=event)
+            if note:
+                print(note, file=sys.stderr)
         else:
             warning = state.update(path, args.id, args.command, getattr(args, "actor", "owner"), change_for(args.command, getattr(args, "value", None)), getattr(args, "commit", False))
             if warning:
