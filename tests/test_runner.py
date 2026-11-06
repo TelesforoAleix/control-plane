@@ -1399,7 +1399,8 @@ def test_accepted_slices_do_not_change_or_log(setup, phase, attention_kind, tool
         assert after['log'] == before['log']
         assert r.path.read_bytes() == state_before
         p.start.assert_not_called()
-        p.poll.assert_not_called()
+        # A running job's process is polled in memory only, so it can free its slot.
+        assert p.poll.call_count == (pass_number if phase == 'running' else 0)
         gh.open.assert_not_called()
         gh.checks.assert_not_called()
         gh.merge.assert_not_called()
@@ -1597,3 +1598,134 @@ def test_frontline_unavailable_does_not_block_scheduling(setup, monkeypatch, fai
     assert len(processes.started) == 1
     assert 'private address' not in capsys.readouterr().err
     assert client.request.call_count == (0 if failure == 'no-config' else 1)
+
+
+@pytest.mark.parametrize('checks,expected', [
+    ([{'name': 'test', 'conclusion': 'CANCELLED'}, {'name': 'test', 'conclusion': 'SUCCESS'}], ('green', '')),
+    ([{'name': 'test', 'conclusion': 'SUCCESS'}, {'name': 'test', 'conclusion': 'CANCELLED'}], ('green', '')),
+    ([{'name': 'test', 'conclusion': 'CANCELLED'}], ('red', 'test')),
+    ([{'name': 'test', 'conclusion': 'CANCELLED'}, {'name': 'lint', 'conclusion': 'SUCCESS'}], ('red', 'test')),
+    ([{'name': 'test', 'conclusion': 'FAILURE'}, {'name': 'test', 'conclusion': 'SUCCESS'}], ('red', 'test')),
+    ([{'name': 'test', 'conclusion': 'TIMED_OUT'}, {'name': 'test', 'conclusion': 'SUCCESS'}], ('red', 'test')),
+    ([{'name': 'test', 'conclusion': 'CANCELLED'}, {'name': 'test', 'conclusion': 'SUCCESS'},
+      {'name': 'lint', 'conclusion': 'ERROR'}], ('red', 'lint')),
+])
+def test_cancelled_check_is_not_red_when_same_name_succeeded(checks, expected):
+    gh = GitHub()
+    gh.call = Mock(return_value=json.dumps({'statusCheckRollup': checks}))
+    assert gh.checks('owner/repo', 1) == expected
+
+
+@pytest.mark.parametrize('tool', ['codex', 'claude'])
+def test_answer_to_node_step_resumes_session(setup, tool):
+    r, p, _ = setup
+    if tool == 'claude':
+        claude_start(r)
+        p.finish('waiting', 'plain text')
+    else:
+        r.run()
+        p.finish('waiting', 'plain text')
+    r.run()
+    assert item(r)['attention']['kind'] == 'node-step'
+    r.run()
+    assert len(p.started) == 1
+    assert main(['--state', str(r.path), 'answer', 'voice/W1', 'node step done']) == 0
+    r.run()
+    assert len(p.started) == 2
+    assert p.started[-1]['prompt'] == 'node step done'
+    assert p.started[-1]['resume'] == 'session-1'
+    assert item(r)['attention'] is None
+
+
+def accept_with_running_job(r, p):
+    r.run()
+    edit(r, lambda s: s.update(state='accepted'))
+
+
+def test_accepted_slice_with_ended_process_frees_slot_and_repository(setup, tmp_path, slice_data):
+    r, p, _ = setup
+    accept_with_running_job(r, p)
+    p.finish()
+    second = copy.deepcopy(item(r))
+    second.update(id='voice/W2', state='ready', session=None, attention=None, log=[],
+                  slot=(NOW - timedelta(minutes=1)).isoformat())
+    data = state.load(r.path)
+    data['slices'].append(second)
+    state.save(r.path, data)
+    r.run()
+    assert len(p.started) == 2
+    assert p.started[-1]['id'] == 'voice/W2'
+    assert r.room(second) is None or 'W1' not in r.room(second)
+
+
+def test_accepted_slice_with_live_process_still_counts(setup):
+    r, p, _ = setup
+    accept_with_running_job(r, p)
+    second = copy.deepcopy(item(r))
+    second.update(id='voice/W2', state='ready', session=None, attention=None, log=[],
+                  slot=(NOW - timedelta(minutes=1)).isoformat())
+    data = state.load(r.path)
+    data['slices'].append(second)
+    state.save(r.path, data)
+    r.run()
+    assert len(p.started) == 1
+    assert 'repository busy (voice/W1)' in state.load(r.path)['slices'][1]['log'][-1]['event']
+
+
+def test_pull_uses_autostash(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr('cplane.runner.state.git', lambda root, *args: calls.append(args))
+    path = tmp_path / 'slices.json'
+    subprocess.run(['git', 'init', '-q', str(tmp_path)], check=True)
+    Git().pull(path)
+    assert calls == [('pull', '--rebase', '--autostash')]
+
+
+def test_pull_with_unstaged_outbox_line(tmp_path):
+    def g(cwd, *a):
+        subprocess.run(['git', '-C', str(cwd), *a], check=True, capture_output=True)
+    remote, local = tmp_path / 'remote.git', tmp_path / 'local'
+    g(tmp_path, 'init', '-q', '--bare', str(remote))
+    g(tmp_path, 'clone', '-q', str(remote), str(local))
+    for key, value in (('user.email', 'a@example.com'), ('user.name', 'a')):
+        g(local, 'config', key, value)
+    (local / 'slices.json.outbox.jsonl').write_text('{}\n')
+    (local / 'slices.json').write_text('{}\n')
+    g(local, 'add', '.')
+    g(local, 'commit', '-qm', 'one')
+    g(local, 'push', '-q', 'origin', 'HEAD')
+    (local / 'slices.json.outbox.jsonl').write_text('{}\n{}\n')
+    Git().pull(local / 'slices.json')
+    assert (local / 'slices.json.outbox.jsonl').read_text() == '{}\n{}\n'
+
+
+def test_failing_pull_still_raises_and_never_launches_autostash(setup):
+    r, p, _ = setup
+    r.git.pull.side_effect = state.StateError('pull failed')
+    with pytest.raises(state.StateError):
+        r.run()
+    assert not p.started
+
+
+@pytest.mark.parametrize('model,expected', [
+    ('opus', 'opus'), ('sonnet', 'sonnet'), ('gpt-6.1-sol', 'opus'),
+    ('Some-SOL', 'opus'), ('other', 'sonnet'), ('Opus', 'sonnet'),
+])
+def test_claude_model_mapping(setup, model, expected):
+    r, p, _ = setup
+    r.codex_reader = lambda: 100
+    edit(r, lambda s: s['executor'].update(tool='claude', model=model))
+    r.claude_reader = lambda: {'at': NOW.timestamp(), 'rate_limits': {'five_hour': {'used_percentage': 1}}}
+    r.run()
+    assert p.started[0]['model'] == expected
+
+
+def test_claude_resume_model_unchanged(setup):
+    r, p, _ = setup
+    claude_start(r)
+    edit(r, lambda s: s['executor'].update(model='opus'))
+    p.finish('question', 'q')
+    r.run()
+    edit(r, lambda s: s['attention'].update(answer='a'))
+    r.run()
+    assert p.started[-1]['model'] == 'sonnet'

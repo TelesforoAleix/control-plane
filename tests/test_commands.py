@@ -87,7 +87,7 @@ def test_not_ready_refused(make_state, slice_data, capsys, command, status):
     assert not path.with_name(path.name + ".outbox.jsonl").exists()
 
 
-@pytest.mark.parametrize("command,kind", [(command, kind) for command in ("approve", "answer") for kind in (None, "question", "escalation", "merge", "node-step", "owner-check") if not ((command == "approve" and kind == "merge") or (command == "answer" and kind in ("question", "escalation")))])
+@pytest.mark.parametrize("command,kind", [(command, kind) for command in ("approve", "answer") for kind in (None, "question", "escalation", "merge", "node-step", "owner-check") if not ((command == "approve" and kind == "merge") or (command == "answer" and kind in ("question", "escalation", "node-step")))])
 def test_wrong_attention_refused(make_state, slice_data, capsys, command, kind):
     slice_data["attention"] = attention(kind) if kind else None
     path = make_state([slice_data])
@@ -226,3 +226,16 @@ def test_stop_before_merge_requires_review(make_state, slice_data, capsys, tool)
     recorded = load(path)['slices'][0]['attention']
     assert recorded['approved'] is True
     assert recorded['review'] == review
+
+
+def test_answer_node_step_and_pending(make_state, slice_data):
+    slice_data["state"] = "in review"
+    slice_data["attention"] = attention("node-step")
+    path = make_state([slice_data])
+    assert pending(load(path))["needs attention"]
+    assert main(["--state", str(path), "answer", "voice/W1", "done"]) == 0
+    assert load(path)["slices"][0]["attention"]["answer"] == "done"
+    assert pending(load(path))["needs attention"][0]["id"] == "voice/W1"  # in review still needs attention
+    slice_data["state"] = "issued"
+    slice_data["attention"] = {**attention("node-step"), "answer": "done"}
+    assert pending({"slices": [slice_data]})["needs attention"] == []
