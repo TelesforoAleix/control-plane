@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import urllib.request
 from urllib.parse import quote
@@ -14,10 +15,13 @@ ENV_VAR = 'CPLANE_ORDERS_URL'
 URL_FILE = 'orders-url'
 DEFAULT_TIMEOUT = 10
 ANSWER_LIMIT = 4000
+TASK_LIMIT = 4000
 RESULTS_DIR = 'order-results'
+FRONTLINE_SESSION = 'frontline'
 
-# Supported owner actions. Orchestrator dispatch arrives in a later change.
-ACTIONS = ("slot", "unslot", "start", "pause", "resume", "approve", "answer")
+# Supported owner actions, including tmux orchestrator dispatch.
+ACTIONS = ("slot", "unslot", "start", "pause", "resume", "approve", "answer",
+           "orchestrator")
 
 
 class Dropped(Exception):
@@ -110,6 +114,15 @@ def _fail(problem):
                     or not isinstance(attention.get('kind'), str)
                     or not isinstance(attention.get('since'), str)):
                 return 'invalid expect'
+    if action == 'orchestrator':
+        if expect is not None:
+            return 'orchestrator requires a null expect'
+        argument = problem.get('argument')
+        if not isinstance(argument, str):
+            return 'orchestrator requires a task'
+        if len(argument) > TASK_LIMIT:
+            return f'orchestrator task exceeds {TASK_LIMIT} characters'
+        return None
     if action == 'answer':
         argument = problem.get('argument')
         if not isinstance(argument, str):
@@ -185,6 +198,58 @@ def _redact(detail, argument):
     return detail
 
 
+def _orchestrator_folder(path, repos, target):
+    """Resolve the target repository folder, rejecting unknown targets."""
+    if not isinstance(target, str) or not target:
+        raise ValueError('orchestrator target must name a repository')
+    path = Path(path)
+    if target == 'development':
+        return path.parent
+    data = state.load(path)
+    names = {item.get('repo') for item in data.get('slices', [])}
+    if target in names:
+        name = target.split('/')[-1]
+        folder = Path(repos) / name
+        if name not in ('', '.', '..') and folder.is_dir():
+            return folder
+    raise ValueError(f'orchestrator target is not a repository: {target}')
+
+
+def open_orchestrator(path, repos, target, task, *, run=subprocess.run):
+    """Open (or reuse) a frontline tmux window running claude for a target."""
+    if not isinstance(task, str):
+        raise ValueError('orchestrator task must be text')
+    if len(task) > TASK_LIMIT:
+        raise ValueError(f'orchestrator task exceeds {TASK_LIMIT} characters')
+    folder = _orchestrator_folder(path, repos, target)
+    probe = run(['tmux', 'has-session', '-t', FRONTLINE_SESSION])
+    if probe.returncode != 0:
+        run(['tmux', 'new-session', '-d', '-s', FRONTLINE_SESSION])
+    listed = run(['tmux', 'list-windows', '-t', FRONTLINE_SESSION, '-F',
+                  '#{window_name}'])
+    windows = (listed.stdout or '').splitlines()
+    if target in windows:
+        raise ValueError(f'orchestrator window for {target} is already open')
+    prompt = (f'You are the orchestrator for {target}. Do only this task.\n\n'
+              f'{task}\n\n'
+              'Put any questions for the owner on the concerned slice as '
+              'cplane attention.')
+    run(['tmux', 'new-window', '-t', FRONTLINE_SESSION, '-n', target,
+         '-c', str(folder), 'claude', prompt])
+
+
+def _dispatch(path, order, repos, launcher):
+    """Run one orchestrator order without ever invoking a shell."""
+    try:
+        launcher(Path(path), Path(repos) if repos is not None else None,
+                 order['slice'], order['argument'])
+    except Exception as error:
+        text = ' '.join(str(error).splitlines()) or type(error).__name__
+        return 'failed', _redact(f'{type(error).__name__}: {text}',
+                                 order.get('argument'))
+    return 'done', 'ok'
+
+
 def _acknowledge(client, order_id, outcome, detail):
     try:
         client.ack(order_id, outcome, detail)
@@ -195,6 +260,8 @@ def _acknowledge(client, order_id, outcome, detail):
 
 def collect(path, runs, client, *, repos=None, launcher=None):
     """Fetch owner orders and apply each against the scheduler once."""
+    if launcher is None:
+        launcher = open_orchestrator
     path = Path(path)
     orders = client.fetch()
     for order in orders:
@@ -209,6 +276,8 @@ def collect(path, runs, client, *, repos=None, launcher=None):
         problem = _fail(order)
         if problem is not None:
             outcome, detail = 'failed', problem
+        elif order['action'] == 'orchestrator':
+            outcome, detail = _dispatch(path, order, repos, launcher)
         else:
             outcome, detail = _apply(path, order)
         _store_result(runs, order_id, outcome, detail)
