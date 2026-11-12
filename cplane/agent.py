@@ -16,7 +16,7 @@ def render(path, *, commit=False, home=None, python=None, environment=None):
     logs = home / 'Library/Logs/cplane'
     source = environment if environment is not None else os.environ
     # launchd does not inherit the terminal's environment or PATH.
-    env = {key: source[key] for key in ('PATH', 'CPLANE_REPOS', 'CPLANE_RUNS') if key in source}
+    env = {key: source[key] for key in ('PATH', 'CPLANE_REPOS', 'CPLANE_RUNS', 'CPLANE_ORDERS_URL') if key in source}
     env.setdefault('PATH', '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin')
     return {
         'Label': LABEL,

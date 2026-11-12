@@ -84,7 +84,7 @@ def commit_state(path, outbox, command, slice_id):
     raise StateError(f"git sync failed after 3 attempts; local commit retained: {last_error}")
 
 
-def update(path, slice_id, command, actor, change, commit=False, *, create=None, event=None):
+def update(path, slice_id, command, actor, change, commit=False, *, create=None, event=None, guard=None):
     path = Path(path).expanduser().resolve()
     outbox = Path(str(path) + ".outbox.jsonl")
     # A stable sidecar inode is necessary: locking the replaced file loses exclusion.
@@ -92,6 +92,10 @@ def update(path, slice_id, command, actor, change, commit=False, *, create=None,
         fcntl.flock(lock, fcntl.LOCK_EX)
         data = load(path)
         item = next((item for item in data["slices"] if item["id"] == slice_id), None)
+        # A guard inspects the current slice while the lock is held and may abort
+        # the mutation (for example a stale owner order) by raising an exception.
+        if guard is not None:
+            guard(item, data)
         if create is not None:
             if item is not None:
                 raise StateError(f"slice already exists: {slice_id}")

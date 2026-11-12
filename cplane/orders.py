@@ -1,14 +1,27 @@
-"""HTTP transport for queued owner orders."""
+"""HTTP transport and processing for queued owner orders."""
 import json
 import os
 from pathlib import Path
+import sys
 import urllib.request
 from urllib.parse import quote
 from urllib.request import Request
 
+from . import state
+from .times import now
+
 ENV_VAR = 'CPLANE_ORDERS_URL'
 URL_FILE = 'orders-url'
 DEFAULT_TIMEOUT = 10
+ANSWER_LIMIT = 4000
+RESULTS_DIR = 'order-results'
+
+# Supported owner actions. Orchestrator dispatch arrives in a later change.
+ACTIONS = ("slot", "unslot", "start", "pause", "resume", "approve", "answer")
+
+
+class Dropped(Exception):
+    """An order whose expectations no longer match the scheduler state."""
 
 
 def orders_url(runs):
@@ -44,3 +57,159 @@ class HttpClient:
                           data=body, method='POST',
                           headers={'Content-Type': 'application/json'})
         urllib.request.urlopen(request, timeout=self.timeout)
+
+
+def _result_path(runs, order_id):
+    name = quote(str(order_id), safe='') + '.json'
+    return Path(runs) / RESULTS_DIR / name
+
+
+def _stored_result(runs, order_id):
+    try:
+        return json.loads(_result_path(runs, order_id).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _store_result(runs, order_id, outcome, detail):
+    """Persist the outcome before acknowledgement so a replay never reapplies it."""
+    target = _result_path(runs, order_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({'id': order_id, 'outcome': outcome, 'detail': detail},
+                         ensure_ascii=False) + '\n'
+    temp = target.with_name(target.name + '.tmp')
+    with temp.open('w') as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temp, target)
+
+
+def _fail(problem):
+    """Validate an order's required fields, action, expectation and answer limit."""
+    if not isinstance(problem, dict):
+        return 'order is not an object'
+    action = problem.get('action')
+    if not isinstance(action, str) or not action:
+        return 'missing action'
+    if action not in ACTIONS:
+        return f'unsupported action: {action}'
+    if not isinstance(problem.get('slice'), str) or not problem['slice']:
+        return 'missing slice'
+    if 'expect' not in problem:
+        return 'missing expect'
+    expect = problem['expect']
+    if expect is not None:
+        if not isinstance(expect, dict):
+            return 'invalid expect'
+        if not isinstance(expect.get('state'), str) or not isinstance(expect.get('paused'), bool):
+            return 'invalid expect'
+        attention = expect.get('attention')
+        if attention is not None:
+            if (not isinstance(attention, dict)
+                    or not isinstance(attention.get('kind'), str)
+                    or not isinstance(attention.get('since'), str)):
+                return 'invalid expect'
+    if action == 'answer':
+        argument = problem.get('argument')
+        if not isinstance(argument, str):
+            return 'answer requires text'
+        if len(argument) > ANSWER_LIMIT:
+            return f'answer exceeds {ANSWER_LIMIT} characters'
+    return None
+
+
+def _mismatch(item, slice_id, expect):
+    """Explain why the current slice disagrees with an order expectation."""
+    if item is None:
+        return f'unknown slice {slice_id}'
+    if expect is None:
+        return None
+    if item['state'] != expect.get('state'):
+        return f"state is {item['state']}, expected {expect.get('state')}"
+    if item['paused'] != expect.get('paused'):
+        return f"paused is {item['paused']}, expected {expect.get('paused')}"
+    actual = item['attention']
+    wanted = expect.get('attention')
+    if wanted is None:
+        if actual is not None:
+            return f"attention is {actual['kind']}, expected none"
+        return None
+    if actual is None:
+        return f"attention is none, expected {wanted.get('kind')}"
+    if actual['kind'] != wanted.get('kind'):
+        return f"attention is {actual['kind']}, expected {wanted.get('kind')}"
+    if actual['since'] != wanted.get('since'):
+        return f"attention since is {actual['since']}, expected {wanted.get('since')}"
+    return None
+
+
+def _notify(path, order, detail):
+    """Append a drop notice to the state outbox without leaking argument text."""
+    notice = {'at': now().isoformat(), 'id': order['slice'], 'event': order['action'],
+              'text': f"Dropped order {order['action']} {order['slice']}: {detail}"}
+    outbox = Path(str(path) + '.outbox.jsonl')
+    with outbox.open('a') as stream:
+        stream.write(json.dumps(notice, ensure_ascii=False) + '\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _apply(path, order):
+    """Run one matched order through the locked state/outbox mutation path."""
+    from .cli import change_for
+
+    def guard(item, data):
+        detail = _mismatch(item, order['slice'], order.get('expect'))
+        if detail is not None:
+            _notify(path, order, detail)
+            raise Dropped(detail)
+
+    try:
+        state.update(path, order['slice'], order['action'], 'frontline',
+                     change_for(order['action'], order.get('argument')), guard=guard)
+    except Dropped as error:
+        return 'dropped', _redact(str(error), order.get('argument'))
+    except state.StateError as error:
+        return 'failed', _redact(' '.join(str(error).splitlines()), order.get('argument'))
+    except Exception as error:
+        text = ' '.join(str(error).splitlines()) or type(error).__name__
+        return 'failed', _redact(f'{type(error).__name__}: {text}', order.get('argument'))
+    return 'done', 'ok'
+
+
+def _redact(detail, argument):
+    """Keep owner argument text out of every diagnostic and stored detail."""
+    if isinstance(argument, str) and argument:
+        return detail.replace(argument, '<argument>')
+    return detail
+
+
+def _acknowledge(client, order_id, outcome, detail):
+    try:
+        client.ack(order_id, outcome, detail)
+    except Exception as error:
+        text = ' '.join(str(error).splitlines()) or type(error).__name__
+        print(f'orders: acknowledgement failed for {order_id}: {text}', file=sys.stderr)
+
+
+def collect(path, runs, client, *, repos=None, launcher=None):
+    """Fetch owner orders and apply each against the scheduler once."""
+    path = Path(path)
+    orders = client.fetch()
+    for order in orders:
+        if not isinstance(order, dict) or not isinstance(order.get('id'), str) or not order['id']:
+            print('orders: skipping entry without an id', file=sys.stderr)
+            continue
+        order_id = order['id']
+        stored = _stored_result(runs, order_id)
+        if stored is not None:
+            _acknowledge(client, order_id, stored.get('outcome'), stored.get('detail'))
+            continue
+        problem = _fail(order)
+        if problem is not None:
+            outcome, detail = 'failed', problem
+        else:
+            outcome, detail = _apply(path, order)
+        _store_result(runs, order_id, outcome, detail)
+        _acknowledge(client, order_id, outcome, detail)

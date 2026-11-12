@@ -419,7 +419,19 @@ class Runner:
             else:
                 self.merge(item, job)
 
+    def orders(self):
+        from .orders import HttpClient, collect, orders_url
+        url = orders_url(self.runs)
+        if url is None:
+            return
+        try:
+            collect(self.path, self.runs, HttpClient(url), repos=self.repos)
+        except Exception as error:
+            text = ' '.join(str(error).splitlines()) or type(error).__name__
+            print(f'orders: {text}', file=sys.stderr)
+
     def run(self):
+        self.orders()
         with Path(str(self.path) + '.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.git.pull(self.path)
