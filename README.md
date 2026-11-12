@@ -18,6 +18,7 @@ uv run cplane pending --json
 uv run cplane --actor planner add --id example/W2 --repo example/project --feature example --title 'Next slice' --brief briefs/W2.md
 uv run cplane --actor planner edit example/W2 --depends-on example/W1
 uv run cplane --actor planner state example/W2 ready
+uv run cplane --actor planner review example/W1 'Looks good'
 uv run cplane show example/W2 --json
 uv run cplane slot example/W1 'Mon 03:00'
 uv run cplane slot example/W1 'tomorrow 06:00'
@@ -43,6 +44,7 @@ this repository contains only the schema and synthetic test fixtures.
 | `state <id> <state> [--session <tool>:<id>:<folder>] [--force --reason <text>]` | Record an allowed state transition. Quote states containing spaces. |
 | `attention <id> --kind <kind> --body <text>` | Record attention and append a notice. |
 | `attention <id> --clear` | Clear attention. |
+| `review <id> <verdict>` | Record a planner review of merge attention. |
 | `slot <id> <when>` / `unslot <id>` | Record or clear a scheduled time. |
 | `start <id>` | Slot a ready slice now. |
 | `pause <id>` / `resume <id>` | Set or clear the pause flag. |
@@ -87,6 +89,10 @@ Attention kinds are `question`, `escalation`, `merge`, `node-step`, and
 answer and approval, and leaves the slice's state as recorded. Clearing attention
 adds no notice. All planner writes accept `--actor` (default `owner`) and
 `--commit`, like the owner commands. `show --json` returns one slice object.
+`review <id> <verdict>` is allowed only on a slice with merge attention. It stores
+the full verdict, mutation timestamp, and actor under `attention.review`, logs a
+`review` event, and appends the notice `Reviewed <id>: <first line of verdict>`.
+The first line of the verdict names the notice; a slice must be reviewed before approval, so `approve` refuses merge attention that is not yet reviewed.
 
 The version 1 shape is defined in [schema/slices.schema.json](schema/slices.schema.json)
 (JSON Schema draft 2020-12). The loader additionally checks uniqueness of slice IDs,
@@ -120,8 +126,8 @@ A minimal synthetic state file:
 ```
 
 `slot` and `start` require `ready`. They name every unmet dependency in a warning
-but still record the slot. `approve` requires merge attention; `answer` requires
-question or escalation attention. Other owner mutations apply to any existing slice,
+but still record the slot. `approve` requires merge attention that has a recorded
+review; `answer` requires question or escalation attention. Other owner mutations apply to any existing slice,
 including repeated calls. Refusals exit nonzero with one line on stderr and leave
 the state unchanged. A warning accompanies a successful command and exits zero.
 
@@ -219,7 +225,7 @@ Codex receives the brief unchanged. Claude receives it followed by the GitHub
 instructions in `cplane/executors.py`: push the branch and return a waiting message
 with a fenced JSON PR request (`branch`, `title`, `body`, `node_steps`). The runner
 creates the PR and checks it on later passes. Failing checks raise escalation;
-pending checks wait. Green checks allow a merge, with owner approval first when
+pending checks wait. When CI is green, checks allow a merge, with owner approval first when
 `stop_before_merge` is true. After merging it resumes Claude with the merge SHA,
 or raises node-step attention if the request requires owner-node work. Codex
 handles its own GitHub work; approved Codex merge attention resumes it with the

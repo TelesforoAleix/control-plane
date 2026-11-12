@@ -35,6 +35,8 @@ def change_for(command, argument=None):
         elif command == "approve":
             if not item["attention"] or item["attention"]["kind"] != "merge":
                 raise state.StateError(f"{item['id']} has no merge attention")
+            if item["stop_before_merge"] and not item["attention"].get("review"):
+                raise state.StateError(f"{item['id']} has no review; record a review before approval")
             item["attention"]["approved"] = True
             notice = f"Approved merge for {item['id']}"
         elif command == "answer":
@@ -134,6 +136,9 @@ def parser():
     move.add_argument("--session")
     move.add_argument("--force", action="store_true")
     move.add_argument("--reason")
+    review = commands.add_parser("review", parents=[common], help="record a planner review")
+    review.add_argument("id")
+    review.add_argument("verdict")
     attention = commands.add_parser("attention", parents=[common], help="record or clear attention")
     attention.add_argument("id")
     attention.add_argument("--kind", choices=planner.KINDS)
@@ -207,7 +212,7 @@ def main(argv=None):
                 details = "\n".join(f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in item.items())
                 folder = str(latest[1]) if latest else '(none)'
                 print(details + f'\nrun: {folder}')
-        elif args.command in ("add", "edit", "state", "attention"):
+        elif args.command in ("add", "edit", "state", "attention", "review"):
             event = None
             if args.command == "state":
                 event = f"state: {args.target}"
