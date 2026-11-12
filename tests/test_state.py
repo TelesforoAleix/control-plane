@@ -17,6 +17,29 @@ def test_schema_is_valid():
     Draft202012Validator.check_schema(state.SCHEMA)
 
 
+def test_review_schema_compatibility(make_state, slice_data):
+    from conftest import attention
+    slice_data['attention'] = attention('merge')
+    path = make_state()
+    assert state.load(path)['version'] == 1
+    slice_data['attention']['review'] = {'verdict': 'Approved', 'at': '2026-10-15T12:00:00+02:00', 'actor': 'planner'}
+    path = make_state()
+    assert state.load(path)['slices'][0]['attention']['review'] == slice_data['attention']['review']
+
+
+@pytest.mark.parametrize('review', [None, 'yes', {}, {'verdict': 'ok', 'at': '2026-10-15T12:00:00+02:00'},
+    {'verdict': 1, 'at': '2026-10-15T12:00:00+02:00', 'actor': 'planner'},
+    {'verdict': 'ok', 'at': '2026-10-15T12:00:00', 'actor': 'planner'},
+    {'verdict': 'ok', 'at': '2026-10-15T12:00:00+02:00', 'actor': 1},
+    {'verdict': 'ok', 'at': '2026-10-15T12:00:00+02:00', 'actor': 'planner', 'extra': True}])
+def test_review_schema_rejects_malformed(make_state, slice_data, review):
+    from conftest import attention
+    slice_data['attention'] = attention('merge')
+    slice_data['attention']['review'] = review
+    with pytest.raises(state.StateError, match='invalid state'):
+        state.load(make_state())
+
+
 @pytest.mark.parametrize("field,value", [
     ("state", "unknown"), ("paused", 1), ("slot", "2026-10-15T12:00:00"),
     ("slot", "bad"), ("id", "bad"), ("executor", {"tool": "other", "model": "x"}),

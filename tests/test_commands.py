@@ -1,12 +1,20 @@
 import copy
 import json
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
 from cplane.cli import main, pending, render
 from cplane.state import load
 from conftest import attention
+
+
+def test_review_ci_readme_documentation():
+    text = (Path(__file__).resolve().parents[1] / 'README.md').read_text().lower()
+    assert 'review <id> <verdict>' in text
+    assert 'reviewed before approval' in text
+    assert 'codex' in text and 'ci is green' in text and 'node-step' in text
 
 
 @pytest.mark.parametrize("command,value,field,expected", [
@@ -50,6 +58,8 @@ def test_start(make_state):
 @pytest.mark.parametrize("command,kind", [("approve", "merge"), ("answer", "question"), ("answer", "escalation")])
 def test_attention_success(make_state, slice_data, command, kind):
     slice_data["attention"] = attention(kind)
+    if command == "approve":
+        slice_data["stop_before_merge"] = False
     path = make_state([slice_data])
     args = [command, "voice/W1"] + (["Yes, proceed\nwith care"] if command == "answer" else [])
     assert main([*args, "--state", str(path)]) == 0
@@ -59,6 +69,23 @@ def test_attention_success(make_state, slice_data, command, kind):
     lines = path.with_name(path.name + ".outbox.jsonl").read_text().splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["event"] == command
+
+
+@pytest.mark.parametrize('reviewed', [False, True])
+def test_review_gate_approval(make_state, slice_data, capsys, reviewed):
+    slice_data['attention'] = attention('merge')
+    if reviewed:
+        slice_data['attention']['review'] = {'verdict': 'Looks good', 'at': '2026-10-15T12:00:00+02:00', 'actor': 'planner'}
+    path = make_state()
+    before = path.read_bytes()
+    assert main(['--state', str(path), 'approve', 'voice/W1']) == (0 if reviewed else 1)
+    if reviewed:
+        assert load(path)['slices'][0]['attention']['approved'] is True
+        assert json.loads(path.with_name(path.name + '.outbox.jsonl').read_text())['event'] == 'approve'
+    else:
+        assert 'review' in capsys.readouterr().err.lower()
+        assert path.read_bytes() == before
+        assert not path.with_name(path.name + '.outbox.jsonl').exists()
 
 
 @pytest.mark.parametrize("command", ["slot", "start"])

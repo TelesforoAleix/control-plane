@@ -7,6 +7,7 @@ import pytest
 
 from cplane.cli import main
 from cplane.state import load
+from conftest import attention
 
 
 STATES = ('planned', 'researching', 'ready', 'issued', 'awaiting handover', 'in review', 'accepted', 'escalated')
@@ -29,6 +30,36 @@ def invoke(path, *args):
 
 def notice_path(path):
     return path.with_name(path.name + '.outbox.jsonl')
+
+
+def test_record_review_notice_and_actor(make_state, slice_data):
+    slice_data['attention'] = attention('merge')
+    path = make_state()
+    assert invoke(path, 'review', 'voice/W1', 'Looks good\nMore detail', '--actor', 'planner', '--commit') == 0
+    item = load(path)['slices'][0]
+    entry = item['log'][-1]
+    assert entry['actor'] == 'planner' and entry['event'] == 'review'
+    assert item['attention']['review'] == {'verdict': 'Looks good\nMore detail', 'at': entry['at'], 'actor': 'planner'}
+    assert json.loads(notice_path(path).read_text()) == {'at': entry['at'], 'id': 'voice/W1', 'event': 'review', 'text': 'Reviewed voice/W1: Looks good'}
+
+
+@pytest.mark.parametrize('kind', [None, 'question', 'escalation', 'node-step', 'owner-check'])
+def test_record_review_requires_merge(make_state, slice_data, capsys, kind):
+    slice_data['attention'] = attention(kind) if kind else None
+    path = make_state()
+    before = path.read_bytes()
+    assert invoke(path, 'review', 'voice/W1', 'verdict') == 1
+    assert 'merge' in capsys.readouterr().err.lower()
+    assert path.read_bytes() == before
+    assert not notice_path(path).exists()
+
+
+def test_record_review_help(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(['review', '--help'])
+    assert exc.value.code == 0
+    output = capsys.readouterr().out.lower()
+    assert 'review' in output and 'verdict' in output and '--actor' in output and '--commit' in output
 
 
 def test_add_defaults_and_log(make_state):

@@ -411,6 +411,94 @@ def test_codex_merge_approval(setup):
     gh.merge.assert_not_called()
 
 
+@pytest.mark.parametrize('source', ['branch', 'reply'])
+def test_codex_ci_pending_then_red(setup, source):
+    r, p, gh = setup
+    gh.find_pr.return_value = 42 if source == 'branch' else None
+    r.run()
+    p.finish('waiting', 'CI pending' if source == 'branch' else 'Opened PR #42')
+    r.run()
+    r.run()
+    assert item(r)['pr'] == 42
+    assert item(r)['attention'] is None
+    assert len(p.started) == 1
+    gh.checks.return_value = ('red', 'unit-tests')
+    r.run()
+    assert item(r)['attention']['kind'] == 'escalation'
+    assert 'unit-tests' in item(r)['attention']['body']
+    gh.merge.assert_not_called()
+
+
+def test_codex_ci_green_gated(setup):
+    r, p, gh = setup
+    gh.find_pr.return_value = 42
+    gh.checks.return_value = ('green', '')
+    r.run()
+    p.finish('waiting', 'CI pending')
+    r.run()
+    r.run()
+    assert item(r)['attention']['kind'] == 'merge'
+    assert item(r)['attention']['body'] == 'Approve PR #42'
+    assert len(p.started) == 1
+    gh.merge.assert_not_called()
+
+
+def test_codex_ci_green_resumes_when_capacity_available(setup):
+    r, p, gh = setup
+    edit(r, lambda s: s.update(stop_before_merge=False))
+    gh.find_pr.return_value = 42
+    gh.checks.return_value = ('green', '')
+    r.run()
+    p.finish('waiting', 'CI pending')
+    r.run()
+    r.codex_reader = lambda: 100
+    r.run()
+    assert len(p.started) == 1
+    r.codex_reader = lambda: 1
+    r.run()
+    assert len(p.started) == 2
+    assert p.started[-1]['prompt'] == 'CI is green on PR #42; merge it and continue.'
+    assert p.started[-1]['resume'] == 'session-1'
+    r.run()
+    assert len(p.started) == 2
+    gh.merge.assert_not_called()
+
+
+def test_codex_ci_no_pr_keeps_node_step(setup):
+    r, p, gh = setup
+    r.run()
+    p.finish('waiting', 'Need owner action')
+    r.run()
+    assert item(r)['attention']['kind'] == 'node-step'
+    assert item(r)['attention']['body'] == 'Need owner action'
+    gh.checks.assert_not_called()
+
+
+@pytest.mark.parametrize('gated', [True, False])
+def test_codex_ci_recovers_failed_state_save(setup, monkeypatch, gated):
+    r, p, gh = setup
+    edit(r, lambda s: s.update(stop_before_merge=gated))
+    gh.find_pr.return_value = 42
+    r.run()
+    p.finish('waiting', 'CI pending')
+    r.run()
+    gh.checks.return_value = ('green', '')
+    save = state.save
+    monkeypatch.setattr(state, 'save', Mock(side_effect=OSError('disk unavailable')))
+    with pytest.raises(OSError):
+        r.run()
+    monkeypatch.setattr(state, 'save', save)
+    r.run()
+    r.run()
+    if gated:
+        assert item(r)['attention']['kind'] == 'merge'
+        assert item(r)['attention']['body'] == 'Approve PR #42'
+        assert len(p.started) == 1
+    else:
+        assert len(p.started) == 2
+        assert p.started[-1]['prompt'] == 'CI is green on PR #42; merge it and continue.'
+
+
 def test_resume_obeys_repository_limit(setup):
     r, p, _ = setup
     r.run()
