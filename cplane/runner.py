@@ -321,6 +321,13 @@ class Runner:
             self.log(item, 'finished', True)
         elif final['kind'] in ('question', 'escalation'):
             self.attention(item, final['kind'], final['body'])
+        elif final['kind'] == 'waiting' and job['tool'] == 'codex':
+            # Codex handles its own merge; hold the job in PR watch and poll checks.
+            if item['pr'] is None:
+                self.attention(item, 'node-step', final['body'])
+            else:
+                item['attention'] = None
+                job['phase'] = 'pr'
         elif job['tool'] == 'claude' and re.match(r'\s*```', final['body']):
             match = re.match(r'\s*```(?:json)?\s*\n(.*?)\n```', final['body'], re.S)
             try:
@@ -389,7 +396,7 @@ class Runner:
         if job['phase'] != 'pr' or item['attention']:
             return
         # Recover PR number if creation succeeded but saving state did not.
-        if item['pr'] is None:
+        if item['pr'] is None and job['tool'] == 'claude':
             item['pr'] = self.github.open(self.github_repo(item), job['request'])
         status, failing = self.github.checks(self.github_repo(item), item['pr'])
         self.log(item, 'checks: ' + status)
@@ -398,6 +405,8 @@ class Runner:
         elif status == 'green':
             if item['stop_before_merge']:
                 self.attention(item, 'merge', f'Approve PR #{item["pr"]}')
+            elif job['tool'] == 'codex':
+                self.launch(item, f'CI is green on PR #{item["pr"]}; merge it and continue.', resume=True)
             else:
                 self.merge(item, job)
 
