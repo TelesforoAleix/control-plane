@@ -41,7 +41,7 @@
           "anyOf": [
             {"type": "null"},
             {"type": "object", "additionalProperties": false, "required": ["kind", "body", "since", "answer", "approved"],
-             "properties": {"kind": {"enum": ["question", "escalation", "merge", "node-step", "owner-check"]}, "body": {"type": "string"}, "since": {"$ref": "#/$defs/timestamp"}, "answer": {"type": ["string", "null"]}, "approved": {"type": "boolean"}}}
+             "properties": {"kind": {"enum": ["question", "escalation", "merge", "node-step", "owner-check"]}, "body": {"type": "string"}, "since": {"$ref": "#/$defs/timestamp"}, "answer": {"type": ["string", "null"]}, "approved": {"type": "boolean"}, "review": {"type": "object", "additionalProperties": false, "required": ["verdict", "at", "actor"], "properties": {"verdict": {"type": "string"}, "at": {"$ref": "#/$defs/timestamp"}, "actor": {"type": "string"}}}}}
           ]
         },
         "log": {"type": "array", "items": {
