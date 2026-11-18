@@ -1,5 +1,20 @@
 # Control plane
 
+> [!NOTE]
+> **Retired on 2026-11-10.** The scheduler moved into a private development system.
+> This repository stays as a record. It is not maintained.
+
+`cplane` was a scheduler for one person. It placed prepared slices of AI coding work in time
+slots and ran Codex and Claude executors on them. The owner could answer questions and approve
+work from the phone.
+
+It was the first piece of the owner's AI development system, Factory. On 2026-11-06 it moved into Factory.
+There it runs on a server, with its state in Postgres. Factory is a private repository for now.
+The work continues with the public platform repository
+[homelab-v2](https://github.com/TelesforoAleix/homelab-v2).
+
+## Original documentation
+
 A scheduler's state file and its commands. `cplane` helps an owner schedule slices of
 coding work, answer questions, approve merges, and see what is pending. It records
 intent through owner commands. `start` sets a slot to now; `resume` clears a pause
